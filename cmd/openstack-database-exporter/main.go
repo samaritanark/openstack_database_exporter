@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -13,9 +15,13 @@ import (
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 
 	"github.com/vexxhost/openstack_database_exporter/internal/collector"
+	"github.com/vexxhost/openstack_database_exporter/internal/collector/octavia"
 )
 
 var (
+	quotaQueryTimeout = kingpin.Flag("octavia.quota-query-timeout", "Shared deadline for Octavia quota database queries; must be positive and shorter than the scrape timeout.").Default("5s").Envar("OCTAVIA_QUOTA_QUERY_TIMEOUT").Duration()
+	quotaDefaultsFile = kingpin.Flag("quota.defaults-file", "Optional JSON file containing all seven Octavia quota defaults; otherwise upstream unlimited defaults are assumed.").Envar("QUOTA_DEFAULTS_FILE").String()
+
 	metricsPath = kingpin.Flag(
 		"web.telemetry-path",
 		"Path under which to expose metrics.",
@@ -90,20 +96,30 @@ func main() {
 	logger.Info("Starting openstack_database_exporter", "version", version.Info())
 	logger.Info("Build context", "build_context", version.BuildContext())
 
+	quotaDefaults, err := loadOctaviaQuotaConfig(*octaviaDatabaseURL, *quotaDefaultsFile, *quotaQueryTimeout)
+	if err != nil {
+		logger.Error("Invalid Octavia quota configuration", "error", err)
+		os.Exit(1)
+	}
+	if *octaviaDatabaseURL != "" && *quotaDefaultsFile == "" {
+		logger.Warn("No Octavia quota defaults file configured; assuming Octavia 2025.2 upstream unlimited (-1) defaults")
+	}
 	reg := collector.NewRegistry(collector.Config{
-		CinderDatabaseURL:    *cinderDatabaseURL,
-		GlanceDatabaseURL:    *glanceDatabaseURL,
-		HeatDatabaseURL:      *heatDatabaseURL,
-		IronicDatabaseURL:    *ironicDatabaseURL,
-		KeystoneDatabaseURL:  *keystoneDatabaseURL,
-		MagnumDatabaseURL:    *magnumDatabaseURL,
-		ManilaDatabaseURL:    *manilaDatabaseURL,
-		NeutronDatabaseURL:   *neutronDatabaseURL,
-		OctaviaDatabaseURL:   *octaviaDatabaseURL,
-		PlacementDatabaseURL: *placementDatabaseURL,
-		NovaDatabaseURL:      *novaDatabaseURL,
-		NovaAPIDatabaseURL:   *novaAPIDatabaseURL,
-		ProjectCacheTTL:      *projectCacheTTL,
+		CinderDatabaseURL:        *cinderDatabaseURL,
+		GlanceDatabaseURL:        *glanceDatabaseURL,
+		HeatDatabaseURL:          *heatDatabaseURL,
+		IronicDatabaseURL:        *ironicDatabaseURL,
+		KeystoneDatabaseURL:      *keystoneDatabaseURL,
+		MagnumDatabaseURL:        *magnumDatabaseURL,
+		ManilaDatabaseURL:        *manilaDatabaseURL,
+		NeutronDatabaseURL:       *neutronDatabaseURL,
+		OctaviaDatabaseURL:       *octaviaDatabaseURL,
+		OctaviaQuotaDefaults:     quotaDefaults,
+		OctaviaQuotaQueryTimeout: *quotaQueryTimeout,
+		PlacementDatabaseURL:     *placementDatabaseURL,
+		NovaDatabaseURL:          *novaDatabaseURL,
+		NovaAPIDatabaseURL:       *novaAPIDatabaseURL,
+		ProjectCacheTTL:          *projectCacheTTL,
 	}, logger)
 
 	http.Handle(*metricsPath, promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
@@ -129,4 +145,19 @@ func main() {
 		logger.Error("Error starting HTTP server", "err", err)
 		os.Exit(1)
 	}
+}
+
+// Disabled Octavia must not read or validate configuration for its collectors.
+func loadOctaviaQuotaConfig(databaseURL, defaultsFile string, timeout time.Duration) (octavia.QuotaDefaults, error) {
+	if databaseURL == "" {
+		return nil, nil
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("octavia quota query timeout must be positive")
+	}
+	defaults, err := octavia.LoadQuotaDefaults(defaultsFile)
+	if err != nil {
+		return nil, fmt.Errorf("octavia quota defaults file %q: %w", defaultsFile, err)
+	}
+	return defaults, nil
 }
