@@ -110,9 +110,9 @@ func NewServerCollector(logger *slog.Logger, novaDB *nova.Queries, novaAPIDB *no
 		novaDB:    novaDB,
 		novaAPIDB: novaAPIDB,
 		serverMetrics: map[string]*prometheus.Desc{
-			"server_local_gb": prometheus.NewDesc(
-				prometheus.BuildFQName(Namespace, Subsystem, "server_local_gb"),
-				"server_local_gb",
+			"server_local_bytes": prometheus.NewDesc(
+				prometheus.BuildFQName(Namespace, Subsystem, "server_local_bytes"),
+				"Server root disk capacity in bytes (source root_gb in GiB multiplied by 2^30).",
 				[]string{"id", "name", "tenant_id"},
 				nil,
 			),
@@ -183,11 +183,11 @@ func (c *ServerCollector) collectServerMetrics(ch chan<- prometheus.Metric) erro
 			azSet[instance.AvailabilityZone.String] = true
 		}
 
-		// Server local GB - using root_gb from instance
+		// Server root disk bytes - using root_gb from instance
 		ch <- prometheus.MustNewConstMetric(
-			c.serverMetrics["server_local_gb"],
+			c.serverMetrics["server_local_bytes"],
 			prometheus.GaugeValue,
-			float64(instance.RootGb.Int32),
+			float64(instance.RootGb.Int32)*(1<<30),
 			instance.Uuid,
 			instance.DisplayName.String,
 			instance.ProjectID.String,

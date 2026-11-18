@@ -30,3 +30,41 @@ go build ./cmd/openstack-database-exporter
 
 Integration tests load embedded fixtures from the pinned openstackdb module.
 Database URLs and exporter configuration remain the same.
+
+## Breaking Nova capacity metric migration
+
+Nova RAM, memory limits and server root-disk capacity gauges now use bytes.
+Old names are removed, with no parallel legacy families. Labels, quota
+calculations, defaults and scrape failure behavior are unchanged. The `ram`
+resource key remains in its original OpenStack units; only emitted capacities
+change.
+
+| Old metric name | New metric name | Source → bytes |
+| --- | --- | --- |
+| `openstack_nova_quota_ram` | `openstack_nova_quota_ram_bytes` | MiB × 2^20 |
+| `openstack_nova_limits_memory_max` | `openstack_nova_limits_memory_max_bytes` | MiB × 2^20 |
+| `openstack_nova_limits_memory_used` | `openstack_nova_limits_memory_used_bytes` | MiB × 2^20 |
+| `openstack_nova_server_local_gb` | `openstack_nova_server_local_bytes` | GiB × 2^30 |
+
+Nova RAM and memory capacities are MiB × 1048576 (2^20). Only quota and memory
+limits preserve `-1` as unlimited. Zero remains zero; signed usage, including
+`-1`, is scaled. Server root-disk capacity uses GiB × 1073741824 (2^30), with
+no unlimited sentinel. Conversion uses floating-point multiplication after
+reading the source integer, avoiding integer overflow; Prometheus float64
+precision still applies.
+
+Quota RAM retains `domain_id`, `tenant`, `type` labels and
+`limit`/`in_use`/`reserved` states. Memory limits retain `domain_id`, `tenant`,
+`tenant_id`; server root-disk capacity retains `id`, `name`, `tenant_id`.
+Usage still comes from Placement and quota reservations remain zero.
+`server_local_bytes` still measures only `instances.root_gb`; it does not add
+ephemeral disks, swap, or actual disk consumption. Server status, task-state,
+CPU and count metrics are unchanged.
+
+Update dashboard queries, alert thresholds, recording rules, metric allowlists,
+and remote consumers together. Remove any old GiB/MiB-to-byte multipliers;
+scale thresholds expressed in source units by the matching factor. Filter
+unlimited limits before arithmetic (for example,
+`openstack_nova_quota_ram_bytes{type="limit"} >= 0`). Historical series retain
+their old names and units and need explicit handling in queries spanning the
+rollout.

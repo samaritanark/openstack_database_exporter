@@ -380,7 +380,7 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 	assertMetricExists(t, families, "openstack_nova_server_status")
 	assertMetricExists(t, families, "openstack_nova_server_task_state")
 	assertGaugeValue(t, families, "openstack_nova_total_vms", 2)
-	assertMetricExists(t, families, "openstack_nova_server_local_gb")
+	assertMetricExists(t, families, "openstack_nova_server_local_bytes")
 	assertMetricExists(t, families, "openstack_nova_running_vms")
 	assertMetricExists(t, families, "openstack_nova_vcpus_available")
 	assertMetricExists(t, families, "openstack_nova_vcpus_used")
@@ -388,6 +388,44 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 	assertMetricExists(t, families, "openstack_nova_memory_used_bytes")
 	assertMetricExists(t, families, "openstack_nova_quota_cores")
 	assertMetricExists(t, families, "openstack_nova_limits_vcpus_max")
+	for _, name := range []string{
+		"openstack_nova_quota_ram",
+		"openstack_nova_limits_memory_max",
+		"openstack_nova_limits_memory_used",
+		"openstack_nova_server_local_gb",
+	} {
+		if _, ok := families[name]; ok {
+			t.Errorf("replaced capacity metric %s is still emitted", name)
+		}
+	}
+	for _, capacity := range []struct {
+		name  string
+		label string
+		want  map[string]float64
+	}{
+		{"openstack_nova_quota_ram_bytes", "type", map[string]float64{"limit": 102400 * (1 << 20), "in_use": 8192 * (1 << 20), "reserved": 0}},
+		{"openstack_nova_limits_memory_max_bytes", "", map[string]float64{"": 102400 * (1 << 20)}},
+		{"openstack_nova_limits_memory_used_bytes", "", map[string]float64{"": 8192 * (1 << 20)}},
+		{"openstack_nova_server_local_bytes", "id", map[string]float64{"inst-001": 20 * (1 << 30), "inst-002": 40 * (1 << 30)}},
+	} {
+		assertMetricExists(t, families, capacity.name)
+		mf := families[capacity.name]
+		if mf.GetType() != dto.MetricType_GAUGE || len(mf.GetMetric()) != len(capacity.want) {
+			t.Errorf("%s: expected gauge with %d samples, got %v", capacity.name, len(capacity.want), mf)
+		}
+		for _, m := range mf.GetMetric() {
+			key := ""
+			for _, label := range m.GetLabel() {
+				if label.GetName() == capacity.label {
+					key = label.GetValue()
+				}
+			}
+			want, ok := capacity.want[key]
+			if !ok || m.GetGauge() == nil || m.GetGauge().GetValue() != want {
+				t.Errorf("%s{%s=%q}: expected %v, got %v", capacity.name, capacity.label, key, want, m)
+			}
+		}
+	}
 
 	// Heat
 	assertMetricExists(t, families, "openstack_heat_stack_status_counter")

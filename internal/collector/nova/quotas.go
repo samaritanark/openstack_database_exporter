@@ -89,8 +89,8 @@ func NewQuotasCollector(logger *slog.Logger, novaDB *nova.Queries, novaAPIDB *no
 				nil,
 			),
 			"quota_ram": prometheus.NewDesc(
-				prometheus.BuildFQName(Namespace, Subsystem, "quota_ram"),
-				"quota_ram",
+				prometheus.BuildFQName(Namespace, Subsystem, "quota_ram_bytes"),
+				"RAM quota in bytes (source MiB multiplied by 2^20); -1 means unlimited only for limits.",
 				[]string{"domain_id", "tenant", "type"},
 				nil,
 			),
@@ -262,6 +262,14 @@ func (c *QuotasCollector) collectQuotaMetrics(ch chan<- prometheus.Metric) error
 
 			// Reserved is always 0 (placement doesn't track reservations this way)
 			reserved := float64(0)
+
+			if quotaType == "ram" {
+				usage *= 1 << 20
+				reserved *= 1 << 20
+				if limit != -1 {
+					limit *= 1 << 20
+				}
+			}
 
 			// Emit the three metrics (in_use, limit, reserved) for each quota type
 			metricName := "quota_" + quotaType

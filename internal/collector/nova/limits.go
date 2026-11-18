@@ -49,14 +49,14 @@ func NewLimitsCollector(logger *slog.Logger, novaDB *nova.Queries, novaAPIDB *no
 				nil,
 			),
 			"limits_memory_max": prometheus.NewDesc(
-				prometheus.BuildFQName(Namespace, Subsystem, "limits_memory_max"),
-				"limits_memory_max",
+				prometheus.BuildFQName(Namespace, Subsystem, "limits_memory_max_bytes"),
+				"Memory max in bytes (source MiB multiplied by 2^20); -1 means unlimited only for limits.",
 				[]string{"domain_id", "tenant", "tenant_id"},
 				nil,
 			),
 			"limits_memory_used": prometheus.NewDesc(
-				prometheus.BuildFQName(Namespace, Subsystem, "limits_memory_used"),
-				"limits_memory_used",
+				prometheus.BuildFQName(Namespace, Subsystem, "limits_memory_used_bytes"),
+				"Memory used in bytes (source MiB multiplied by 2^20); -1 means unlimited only for limits.",
 				[]string{"domain_id", "tenant", "tenant_id"},
 				nil,
 			),
@@ -209,6 +209,9 @@ func (c *LimitsCollector) collectLimitsMetrics(ch chan<- prometheus.Metric) erro
 			memoryMax = limitsByProject[projectID]["ram"]
 		}
 
+		if memoryMax != -1 {
+			memoryMax *= 1 << 20
+		}
 		ch <- prometheus.MustNewConstMetric(
 			c.limitsMetrics["limits_memory_max"],
 			prometheus.GaugeValue,
@@ -218,7 +221,7 @@ func (c *LimitsCollector) collectLimitsMetrics(ch chan<- prometheus.Metric) erro
 		ch <- prometheus.MustNewConstMetric(
 			c.limitsMetrics["limits_memory_used"],
 			prometheus.GaugeValue,
-			memoryUsedByProject[projectID],
+			memoryUsedByProject[projectID]*(1<<20),
 			domainID, tenantName, projectID,
 		)
 
