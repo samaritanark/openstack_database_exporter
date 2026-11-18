@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vexxhost/openstack_database_exporter/internal/util"
@@ -106,6 +108,21 @@ func (c *VolumesCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	// The attachment join can return multiple rows per volume. Keep one volume
+	// for capacity and counts, and retain every distinct nonempty server ID.
+	// All other projected fields come from the volume and its volume type.
+	byID := make(map[string]cinderdb.VolumeGetAllWithAttachmentsRow, len(volumes))
+	servers := make(map[string]map[string]struct{}, len(volumes))
+	for _, volume := range volumes {
+		byID[volume.ID] = volume
+		if servers[volume.ID] == nil {
+			servers[volume.ID] = make(map[string]struct{})
+		}
+		if volume.ServerID.String != "" {
+			servers[volume.ID][volume.ServerID.String] = struct{}{}
+		}
+	}
+
 	volume_status_counter := map[string]int{
 		"creating":          0,
 		"available":         0,
@@ -129,7 +146,14 @@ func (c *VolumesCollector) Collect(ch chan<- prometheus.Metric) {
 		"extending":         0,
 	}
 
-	for _, volume := range volumes {
+	for id, volume := range byID {
+		serverIDs := make([]string, 0, len(servers[id]))
+		for serverID := range servers[id] {
+			serverIDs = append(serverIDs, serverID)
+		}
+		slices.Sort(serverIDs)
+		serverID := strings.Join(serverIDs, ",")
+
 		volume_status_counter[volume.Status.String]++
 
 		ch <- prometheus.MustNewConstMetric(
@@ -144,7 +168,7 @@ func (c *VolumesCollector) Collect(ch chan<- prometheus.Metric) {
 			volume.ProjectID.String,
 			volume.UserID.String,
 			volume.VolumeType.String,
-			volume.ServerID.String,
+			serverID,
 		)
 
 		ch <- prometheus.MustNewConstMetric(
@@ -179,7 +203,7 @@ func (c *VolumesCollector) Collect(ch chan<- prometheus.Metric) {
 			volume.ProjectID.String,
 			strconv.Itoa(int(volume.Size.Int32)),
 			volume.VolumeType.String,
-			volume.ServerID.String,
+			serverID,
 		)
 	}
 
@@ -195,7 +219,7 @@ func (c *VolumesCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(
 		volumesDesc,
 		prometheus.GaugeValue,
-		float64(len(volumes)),
+		float64(len(byID)),
 	)
 
 	ch <- prometheus.MustNewConstMetric(volumesUpDesc, prometheus.GaugeValue, 1)
