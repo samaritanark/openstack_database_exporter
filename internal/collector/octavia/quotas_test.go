@@ -3,6 +3,7 @@ package octavia
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"io"
@@ -152,37 +153,52 @@ func TestQuotasCollectorFailures(t *testing.T) {
 			}()
 			mock.MatchExpectationsInOrder(false)
 			db.SetMaxOpenConns(1)
-			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError}))
 			defaults := testDefaults()
-			timeout := 20 * time.Millisecond
+			// Non-timeout failures must reach SQL despite concurrent inventory collection.
+			timeout := time.Second
+			operation, errorType := "query limits", "*errors.errorString"
+			injectedError := &mysql.MySQLError{Number: 1205, Message: "injected failure"}
 			switch scenario {
 			case "limits query":
-				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillReturnError(sql.ErrConnDone)
+				errorType = "*mysql.MySQLError"
+				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillReturnError(injectedError)
 			case "usage query":
+				operation, errorType = "query usage", "*mysql.MySQLError"
 				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillReturnRows(sqlmock.NewRows(limitColumns).AddRow("p1", 1, 1, 1, 1, 1, 1, 1, nil, nil, nil, nil, nil, nil, nil))
-				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaUsageGetAll)).WillReturnError(sql.ErrConnDone)
+				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaUsageGetAll)).WillReturnError(injectedError)
 			case "limits timeout":
-				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillDelayFor(time.Second).WillReturnRows(sqlmock.NewRows(limitColumns))
+				timeout = 250 * time.Millisecond
+				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillDelayFor(5 * time.Second).WillReturnRows(sqlmock.NewRows(limitColumns))
 			case "usage timeout":
+				operation = "query usage"
+				timeout = 250 * time.Millisecond
 				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillReturnRows(sqlmock.NewRows(limitColumns))
-				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaUsageGetAll)).WillDelayFor(time.Second).WillReturnRows(sqlmock.NewRows(usageColumns))
+				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaUsageGetAll)).WillDelayFor(5 * time.Second).WillReturnRows(sqlmock.NewRows(usageColumns))
 			case "limits scan":
+				errorType = "*fmt.wrapError"
 				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillReturnRows(sqlmock.NewRows(limitColumns).
 					AddRow("p1", "invalid integer", 1, 1, 1, 1, 1, 1, nil, nil, nil, nil, nil, nil, nil))
 			case "usage scan", "usage iteration":
+				operation = "query usage"
 				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillReturnRows(sqlmock.NewRows(limitColumns))
 				rows := sqlmock.NewRows(usageColumns)
 				if scenario == "usage scan" {
+					errorType = "*fmt.wrapError"
 					rows.AddRow("p1", "member", "invalid integer")
 				} else {
-					rows.AddRow("p1", "member", 1).RowError(0, sql.ErrConnDone)
+					errorType = "*mysql.MySQLError"
+					rows.AddRow("p1", "member", 1).RowError(0, injectedError)
 				}
 				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaUsageGetAll)).WillReturnRows(rows)
 			case "shared deadline":
-				timeout = 250 * time.Millisecond
-				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillDelayFor(150 * time.Millisecond).WillReturnRows(sqlmock.NewRows(limitColumns))
-				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaUsageGetAll)).WillDelayFor(150 * time.Millisecond).WillReturnRows(sqlmock.NewRows(usageColumns))
+				operation = "query usage"
+				// Each read fits the budget alone; together they must exhaust it in usage.
+				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaGetAll)).WillDelayFor(600 * time.Millisecond).WillReturnRows(sqlmock.NewRows(limitColumns))
+				mock.ExpectQuery(regexp.QuoteMeta(octaviadb.QuotaUsageGetAll)).WillDelayFor(600 * time.Millisecond).WillReturnRows(sqlmock.NewRows(usageColumns))
 			case "invalid defaults":
+				operation = "validate defaults"
 				defaults = QuotaDefaults{}
 			}
 			registry := prometheus.NewPedanticRegistry()
@@ -206,6 +222,18 @@ func TestQuotasCollectorFailures(t *testing.T) {
 			for _, resource := range octaviaQuotaResources {
 				require.NotContains(t, response.Body.String(), "openstack_loadbalancer_quota_"+resource.metric)
 			}
+			var failure struct {
+				Operation string `json:"operation"`
+				ErrorType string `json:"error_type"`
+				MySQLCode uint16 `json:"mysql_error_code"`
+			}
+			require.NoError(t, json.Unmarshal(logs.Bytes(), &failure))
+			require.Equal(t, operation, failure.Operation)
+			require.Equal(t, errorType, failure.ErrorType)
+			if errorType == "*mysql.MySQLError" {
+				require.Equal(t, injectedError.Number, failure.MySQLCode)
+			}
+			// Also proves delayed queries began: cancellation before SQL leaves an expectation unmet.
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
