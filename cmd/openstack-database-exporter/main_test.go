@@ -79,6 +79,28 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 		`INSERT INTO quota_usages (project_id, resource, in_use, reserved, deleted) VALUES
 		 ('proj-001', 'gigabytes', 250, 0, 0)`,
 	)
+	// Persisted quota accounting is independent of the inventory above.
+	itest.SeedSQL(t, cinderRes.DB,
+		`INSERT INTO volume_types (id, name, deleted) VALUES
+		 ('vtype-fast', 'fast_ssd', 0), ('vtype-deleted', 'old', 1)`,
+		`INSERT INTO quota_classes (class_name, resource, hard_limit, deleted) VALUES
+		 ('default', 'volumes', 22, 0), ('default', 'gigabytes', 400, 0),
+		 ('default', 'snapshots_fast_ssd', 13, 0), ('default', 'volumes', 999, 1)`,
+		`INSERT INTO quotas (project_id, resource, hard_limit, deleted) VALUES
+		 ('proj-001', 'volumes', NULL, 0), ('proj-001', 'snapshots', -1, 0),
+		 ('proj-001', 'backups', 0, 0), ('proj-001', 'groups', 8, 0),
+		 ('proj-001', 'backup_gigabytes', 80, 0), ('proj-001', 'per_volume_gigabytes', 12, 0),
+		 ('proj-001', 'volumes_fast_ssd', 4, 0), ('proj-001', 'snapshots_fast_ssd', NULL, 0),
+		 ('proj-001', 'gigabytes_fast_ssd', 30, 0), ('proj-001', 'volumes', 999, 1),
+		 ('cinder-idle', 'groups', NULL, 0)`,
+		`INSERT INTO quota_usages (project_id, resource, in_use, reserved, deleted) VALUES
+		 ('proj-001', 'volumes', 2, 1, 0), ('proj-001', 'snapshots', -1, 2, 0),
+		 ('proj-001', 'backups', 0, -1, 0), ('proj-001', 'groups', 4, 0, 0),
+		 ('proj-001', 'backup_gigabytes', 6, 2, 0),
+		 ('proj-001', 'volumes_fast_ssd', 1, 2, 0), ('proj-001', 'snapshots_fast_ssd', 3, 1, 0),
+		 ('proj-001', 'gigabytes_fast_ssd', 9, -1, 0),
+		 ('usage-only', 'backups', 7, 4, 0), ('proj-001', 'volumes', 999, 999, 1)`,
+	)
 
 	// Glance: images
 	itest.SeedSQL(t, glanceRes.DB,
@@ -340,11 +362,112 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 	assertMetricExists(t, families, "openstack_cinder_agent_state")
 	assertGaugeValue(t, families, "openstack_cinder_volumes", 2)
 	assertGaugeValue(t, families, "openstack_cinder_snapshots", 2)
-	assertMetricExists(t, families, "openstack_cinder_volume_gb")
+	assertMetricExists(t, families, "openstack_cinder_volume_bytes")
 	assertMetricExists(t, families, "openstack_cinder_volume_status")
 	assertMetricExists(t, families, "openstack_cinder_volume_status_counter")
-	assertMetricExists(t, families, "openstack_cinder_limits_volume_max_gb")
-	assertMetricExists(t, families, "openstack_cinder_limits_volume_used_gb")
+	assertMetricExists(t, families, "openstack_cinder_limits_volume_max_bytes")
+	assertMetricExists(t, families, "openstack_cinder_limits_volume_used_bytes")
+	// Match complete label sets, metric types and values after DB-to-HTTP collection.
+	assertCinderSample := func(name string, labels map[string]string, want float64) {
+		t.Helper()
+		family := families["openstack_cinder_"+name]
+		if family == nil || family.GetType() != dto.MetricType_GAUGE {
+			t.Errorf("missing Cinder gauge %s", name)
+			return
+		}
+		matches := 0
+		for _, metric := range family.Metric {
+			if len(metric.Label) != len(labels) {
+				continue
+			}
+			match := true
+			for _, label := range metric.Label {
+				value, exists := labels[label.GetName()]
+				if !exists || value != label.GetValue() {
+					match = false
+				}
+			}
+			if match {
+				matches++
+				if metric.Gauge == nil || metric.GetGauge().GetValue() != want {
+					t.Errorf("%s %v: got %v, want %v", name, labels, metric.GetGauge(), want)
+				}
+			}
+		}
+		if matches != 1 {
+			t.Errorf("%s %v: got %d samples, want 1", name, labels, matches)
+		}
+	}
+	assertCinderSample("quota_up", nil, 1)
+	for _, quota := range []struct {
+		name                   string
+		typed, states          bool
+		limit, inUse, reserved float64
+	}{
+		{"quota_volumes", false, true, 22, 2, 1},
+		{"quota_snapshots", false, true, -1, -1, 2},
+		{"quota_backups", false, true, 0, 0, -1},
+		{"quota_groups", false, true, 8, 4, 0},
+		{"quota_per_volume_bytes", false, true, 12 * (1 << 30), 0, 0},
+		{"limits_volume_max_bytes", false, false, 1000 * (1 << 30), 0, 0},
+		{"limits_volume_used_bytes", false, false, 250 * (1 << 30), 0, 0},
+		{"limits_volume_reserved_bytes", false, false, 0, 0, 0},
+		{"limits_backup_max_bytes", false, false, 80 * (1 << 30), 0, 0},
+		{"limits_backup_used_bytes", false, false, 6 * (1 << 30), 0, 0},
+		{"limits_backup_reserved_bytes", false, false, 2 * (1 << 30), 0, 0},
+		{"volume_type_quota_volumes", true, true, 4, 1, 2},
+		{"volume_type_quota_snapshots", true, true, 13, 3, 1},
+		{"volume_type_quota_bytes", true, false, 30 * (1 << 30), 0, 0},
+		{"volume_type_quota_in_use_bytes", true, false, 9 * (1 << 30), 0, 0},
+		{"volume_type_quota_reserved_bytes", true, false, -(1 << 30), 0, 0},
+	} {
+		labels := map[string]string{"tenant": "test-project-1", "tenant_id": "proj-001", "domain_id": "domain-001"}
+		if quota.typed {
+			labels["volume_type"] = "fast_ssd"
+		}
+		if quota.states {
+			labels["type"] = "limit"
+		}
+		assertCinderSample(quota.name, labels, quota.limit)
+		if quota.states && quota.name != "quota_per_volume_bytes" {
+			labels["type"] = "in_use"
+			assertCinderSample(quota.name, labels, quota.inUse)
+			labels["type"] = "reserved"
+			assertCinderSample(quota.name, labels, quota.reserved)
+		}
+	}
+	for _, projectID := range []string{"usage-only", "cinder-idle"} {
+		labels := map[string]string{"tenant": projectID, "tenant_id": projectID, "domain_id": ""}
+		assertCinderSample("limits_volume_max_bytes", labels, 400*(1<<30))
+		labels["type"] = "limit"
+		assertCinderSample("quota_backups", labels, 10)
+		labels["type"] = "in_use"
+		usage := float64(0)
+		if projectID == "usage-only" {
+			usage = 7
+		}
+		assertCinderSample("quota_backups", labels, usage)
+	}
+	assertCinderSample("volume_bytes", map[string]string{
+		"id": "vol-001", "name": "boot-vol", "status": "in-use", "availability_zone": "nova",
+		"bootable": "true", "tenant_id": "proj-001", "user_id": "user-001", "volume_type": "SSD", "server_id": "server-001",
+	}, 40*(1<<30))
+	assertCinderSample("volume_bytes", map[string]string{
+		"id": "vol-002", "name": "data-vol", "status": "available", "availability_zone": "nova",
+		"bootable": "false", "tenant_id": "proj-001", "user_id": "user-001", "volume_type": "SSD", "server_id": "",
+	}, 100*(1<<30))
+	assertCinderSample("volume_status", map[string]string{
+		"id": "vol-001", "name": "boot-vol", "status": "in-use", "bootable": "true", "tenant_id": "proj-001",
+		"size": "40", "volume_type": "SSD", "server_id": "server-001",
+	}, 5)
+	for _, retired := range []string{
+		"volume_gb", "limits_volume_max_gb", "limits_volume_used_gb", "limits_backup_max_gb",
+		"limits_backup_used_gb", "volume_type_quota_gigabytes",
+	} {
+		if _, exists := families["openstack_cinder_"+retired]; exists {
+			t.Errorf("retired Cinder metric %s remains", retired)
+		}
+	}
 
 	// Glance
 	assertGaugeValue(t, families, "openstack_glance_images", 2)
