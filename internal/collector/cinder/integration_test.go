@@ -50,7 +50,7 @@ func TestIntegration_VolumesCollector(t *testing.T) {
 
 		collector := NewVolumesCollector(db, logger)
 
-		// 2 active volumes × 2 metrics (volume_gb + volume_status) = 4
+		// 2 active volumes × 2 metrics (volume_bytes + volume_status) = 4
 		// + 20 status counters + 1 volumes gauge + 1 up = 26
 		count := testutil.CollectAndCount(collector)
 		if count != 26 {
@@ -204,13 +204,13 @@ func TestIntegration_LimitsCollector(t *testing.T) {
 		resolver := project.NewResolver(logger, nil, 0)
 		collector := NewLimitsCollector(db, logger, resolver)
 		count := testutil.CollectAndCount(collector)
-		if count != 0 {
-			t.Fatalf("expected 0 metrics for empty quotas, got %d", count)
+		if count != 1 {
+			t.Fatalf("expected health only for empty quotas, got %d", count)
 		}
 	})
 
 	t.Run("with quotas, usage, and volume types", func(t *testing.T) {
-		// Seed volume types for volume_type_quota_gigabytes
+		// Seed volume types for volume_type_quota_bytes
 		itest.SeedSQL(t, db,
 			`INSERT INTO volume_types (id, name, deleted) VALUES
 			('vt-001', 'standard', 0),
@@ -231,49 +231,49 @@ func TestIntegration_LimitsCollector(t *testing.T) {
 
 		// Verify backup limits: proj-001 has explicit backup quota (500/50),
 		// proj-002 has no backup quota so defaults apply (1000/0)
-		err := testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_limits_backup_max_gb limits_backup_max_gb
-# TYPE openstack_cinder_limits_backup_max_gb gauge
-openstack_cinder_limits_backup_max_gb{tenant="proj-001",tenant_id="proj-001"} 500
-openstack_cinder_limits_backup_max_gb{tenant="proj-002",tenant_id="proj-002"} 1000
-# HELP openstack_cinder_limits_backup_used_gb limits_backup_used_gb
-# TYPE openstack_cinder_limits_backup_used_gb gauge
-openstack_cinder_limits_backup_used_gb{tenant="proj-001",tenant_id="proj-001"} 50
-openstack_cinder_limits_backup_used_gb{tenant="proj-002",tenant_id="proj-002"} 0
-`), "openstack_cinder_limits_backup_max_gb", "openstack_cinder_limits_backup_used_gb")
+		err := testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_limits_backup_max_bytes Quota capacity in bytes (source GiB multiplied by 2^30); -1 means unlimited only for limits.
+# TYPE openstack_cinder_limits_backup_max_bytes gauge
+openstack_cinder_limits_backup_max_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001"} 536870912000
+openstack_cinder_limits_backup_max_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002"} 1073741824000
+# HELP openstack_cinder_limits_backup_used_bytes Quota capacity in bytes (source GiB multiplied by 2^30); -1 means unlimited only for limits.
+# TYPE openstack_cinder_limits_backup_used_bytes gauge
+openstack_cinder_limits_backup_used_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001"} 53687091200
+openstack_cinder_limits_backup_used_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002"} 0
+`), "openstack_cinder_limits_backup_max_bytes", "openstack_cinder_limits_backup_used_bytes")
 		if err != nil {
 			t.Fatalf("unexpected backup limits error: %v", err)
 		}
 
 		// Verify volume limits
-		err = testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_limits_volume_max_gb limits_volume_max_gb
-# TYPE openstack_cinder_limits_volume_max_gb gauge
-openstack_cinder_limits_volume_max_gb{tenant="proj-001",tenant_id="proj-001"} 1000
-openstack_cinder_limits_volume_max_gb{tenant="proj-002",tenant_id="proj-002"} 2000
-# HELP openstack_cinder_limits_volume_used_gb limits_volume_used_gb
-# TYPE openstack_cinder_limits_volume_used_gb gauge
-openstack_cinder_limits_volume_used_gb{tenant="proj-001",tenant_id="proj-001"} 250
-openstack_cinder_limits_volume_used_gb{tenant="proj-002",tenant_id="proj-002"} 100
-`), "openstack_cinder_limits_volume_max_gb", "openstack_cinder_limits_volume_used_gb")
+		err = testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_limits_volume_max_bytes Quota capacity in bytes (source GiB multiplied by 2^30); -1 means unlimited only for limits.
+# TYPE openstack_cinder_limits_volume_max_bytes gauge
+openstack_cinder_limits_volume_max_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001"} 1073741824000
+openstack_cinder_limits_volume_max_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002"} 2147483648000
+# HELP openstack_cinder_limits_volume_used_bytes Quota capacity in bytes (source GiB multiplied by 2^30); -1 means unlimited only for limits.
+# TYPE openstack_cinder_limits_volume_used_bytes gauge
+openstack_cinder_limits_volume_used_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001"} 268435456000
+openstack_cinder_limits_volume_used_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002"} 107374182400
+`), "openstack_cinder_limits_volume_max_bytes", "openstack_cinder_limits_volume_used_bytes")
 		if err != nil {
 			t.Fatalf("unexpected volume limits error: %v", err)
 		}
 
-		// Verify volume_type_quota_gigabytes: -1 for each project × type
-		err = testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_volume_type_quota_gigabytes volume_type_quota_gigabytes
-# TYPE openstack_cinder_volume_type_quota_gigabytes gauge
-openstack_cinder_volume_type_quota_gigabytes{tenant="proj-001",tenant_id="proj-001",volume_type="__DEFAULT__"} -1
-openstack_cinder_volume_type_quota_gigabytes{tenant="proj-001",tenant_id="proj-001",volume_type="standard"} -1
-openstack_cinder_volume_type_quota_gigabytes{tenant="proj-002",tenant_id="proj-002",volume_type="__DEFAULT__"} -1
-openstack_cinder_volume_type_quota_gigabytes{tenant="proj-002",tenant_id="proj-002",volume_type="standard"} -1
-`), "openstack_cinder_volume_type_quota_gigabytes")
+		// Verify volume_type_quota_bytes: -1 for each project × type
+		err = testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_volume_type_quota_bytes Quota capacity in bytes (source GiB multiplied by 2^30); -1 means unlimited only for limits.
+# TYPE openstack_cinder_volume_type_quota_bytes gauge
+openstack_cinder_volume_type_quota_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001",volume_type="__DEFAULT__"} -1
+openstack_cinder_volume_type_quota_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001",volume_type="standard"} -1
+openstack_cinder_volume_type_quota_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002",volume_type="__DEFAULT__"} -1
+openstack_cinder_volume_type_quota_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002",volume_type="standard"} -1
+`), "openstack_cinder_volume_type_quota_bytes")
 		if err != nil {
 			t.Fatalf("unexpected volume_type_quota error: %v", err)
 		}
 
-		// Total metrics: 2 projects × 4 limit metrics + 2 projects × 2 volume_type_quotas = 12
+		// Two projects x six capacity metrics + four legacy type limits + health.
 		count := testutil.CollectAndCount(collector)
-		if count != 12 {
-			t.Fatalf("expected 12 limit metrics, got %d", count)
+		if count != 17 {
+			t.Fatalf("expected 17 limit/health metrics, got %d", count)
 		}
 	})
 
@@ -289,13 +289,13 @@ openstack_cinder_volume_type_quota_gigabytes{tenant="proj-002",tenant_id="proj-0
 
 		// proj-001 should now have standard=300, __DEFAULT__=-1
 		// proj-002 should still have both at -1
-		err := testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_volume_type_quota_gigabytes volume_type_quota_gigabytes
-# TYPE openstack_cinder_volume_type_quota_gigabytes gauge
-openstack_cinder_volume_type_quota_gigabytes{tenant="proj-001",tenant_id="proj-001",volume_type="__DEFAULT__"} -1
-openstack_cinder_volume_type_quota_gigabytes{tenant="proj-001",tenant_id="proj-001",volume_type="standard"} 300
-openstack_cinder_volume_type_quota_gigabytes{tenant="proj-002",tenant_id="proj-002",volume_type="__DEFAULT__"} -1
-openstack_cinder_volume_type_quota_gigabytes{tenant="proj-002",tenant_id="proj-002",volume_type="standard"} -1
-`), "openstack_cinder_volume_type_quota_gigabytes")
+		err := testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_volume_type_quota_bytes Quota capacity in bytes (source GiB multiplied by 2^30); -1 means unlimited only for limits.
+# TYPE openstack_cinder_volume_type_quota_bytes gauge
+openstack_cinder_volume_type_quota_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001",volume_type="__DEFAULT__"} -1
+openstack_cinder_volume_type_quota_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001",volume_type="standard"} 322122547200
+openstack_cinder_volume_type_quota_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002",volume_type="__DEFAULT__"} -1
+openstack_cinder_volume_type_quota_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002",volume_type="standard"} -1
+`), "openstack_cinder_volume_type_quota_bytes")
 		if err != nil {
 			t.Fatalf("unexpected per-type quota error: %v", err)
 		}
@@ -314,19 +314,46 @@ openstack_cinder_volume_type_quota_gigabytes{tenant="proj-002",tenant_id="proj-0
 
 		// proj-003 should show usage from quota_usages and default limits (1000)
 		// Also include proj-001 and proj-002 from earlier subtests (shared DB)
-		err := testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_limits_volume_used_gb limits_volume_used_gb
-# TYPE openstack_cinder_limits_volume_used_gb gauge
-openstack_cinder_limits_volume_used_gb{tenant="proj-001",tenant_id="proj-001"} 250
-openstack_cinder_limits_volume_used_gb{tenant="proj-002",tenant_id="proj-002"} 100
-openstack_cinder_limits_volume_used_gb{tenant="proj-003",tenant_id="proj-003"} 500
-# HELP openstack_cinder_limits_backup_used_gb limits_backup_used_gb
-# TYPE openstack_cinder_limits_backup_used_gb gauge
-openstack_cinder_limits_backup_used_gb{tenant="proj-001",tenant_id="proj-001"} 50
-openstack_cinder_limits_backup_used_gb{tenant="proj-002",tenant_id="proj-002"} 0
-openstack_cinder_limits_backup_used_gb{tenant="proj-003",tenant_id="proj-003"} 30
-`), "openstack_cinder_limits_volume_used_gb", "openstack_cinder_limits_backup_used_gb")
+		err := testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_cinder_limits_volume_used_bytes Quota capacity in bytes (source GiB multiplied by 2^30); -1 means unlimited only for limits.
+# TYPE openstack_cinder_limits_volume_used_bytes gauge
+openstack_cinder_limits_volume_used_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001"} 268435456000
+openstack_cinder_limits_volume_used_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002"} 107374182400
+openstack_cinder_limits_volume_used_bytes{domain_id="",tenant="proj-003",tenant_id="proj-003"} 536870912000
+# HELP openstack_cinder_limits_backup_used_bytes Quota capacity in bytes (source GiB multiplied by 2^30); -1 means unlimited only for limits.
+# TYPE openstack_cinder_limits_backup_used_bytes gauge
+openstack_cinder_limits_backup_used_bytes{domain_id="",tenant="proj-001",tenant_id="proj-001"} 53687091200
+openstack_cinder_limits_backup_used_bytes{domain_id="",tenant="proj-002",tenant_id="proj-002"} 0
+openstack_cinder_limits_backup_used_bytes{domain_id="",tenant="proj-003",tenant_id="proj-003"} 32212254720
+`), "openstack_cinder_limits_volume_used_bytes", "openstack_cinder_limits_backup_used_bytes")
 		if err != nil {
 			t.Fatalf("unexpected error for usage-without-quota: %v", err)
 		}
 	})
+}
+
+func TestIntegration_QuotasAccounting(t *testing.T) {
+	itest.SkipIfNoDocker(t)
+	db := cinderDB(t)
+	itest.SeedSQL(t, db,
+		`INSERT INTO quota_classes (class_name,resource,hard_limit,deleted) VALUES ('default','volumes',22,0),('default','volumes',999,1)`,
+		`INSERT INTO volume_types (id,name,deleted) VALUES ('t','fast_ssd',0),('deleted','old',1)`,
+		`INSERT INTO quotas (project_id,resource,hard_limit,deleted) VALUES ('p','snapshots',-1,0),('p','volumes',999,1)`,
+		`INSERT INTO quota_usages (project_id,resource,in_use,reserved,deleted) VALUES ('p','volumes',3,2,0),('p','backups',7,1,0),('p','volumes_fast_ssd',2,1,0),('p','volumes',999,999,1)`)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	f := gatherQuotas(t, NewQuotasCollector(db, logger, project.NewResolver(logger, nil, 0)))
+	if quotaSample(t, f, "quota_volumes", map[string]string{"type": "limit"}) != 22 {
+		t.Fatal("default class not applied")
+	}
+	if quotaSample(t, f, "quota_volumes", map[string]string{"type": "in_use"}) != 3 {
+		t.Fatal("usage-only project lost")
+	}
+	if quotaSample(t, f, "quota_volumes", map[string]string{"type": "reserved"}) != 2 {
+		t.Fatal("reservation lost")
+	}
+	if quotaSample(t, f, "quota_snapshots", map[string]string{"type": "limit"}) != -1 {
+		t.Fatal("unlimited override lost")
+	}
+	if quotaSample(t, f, "volume_type_quota_volumes", map[string]string{"type": "in_use"}) != 2 {
+		t.Fatal("typed accounting lost")
+	}
 }

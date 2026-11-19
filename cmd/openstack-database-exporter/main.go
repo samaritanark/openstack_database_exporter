@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -15,12 +16,14 @@ import (
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 
 	"github.com/vexxhost/openstack_database_exporter/internal/collector"
+	"github.com/vexxhost/openstack_database_exporter/internal/collector/cinder"
 	"github.com/vexxhost/openstack_database_exporter/internal/collector/octavia"
 )
 
 var (
-	quotaQueryTimeout = kingpin.Flag("octavia.quota-query-timeout", "Shared deadline for Octavia quota database queries; must be positive and shorter than the scrape timeout.").Default("5s").Envar("OCTAVIA_QUOTA_QUERY_TIMEOUT").Duration()
-	quotaDefaultsFile = kingpin.Flag("quota.defaults-file", "Optional JSON file containing all seven Octavia quota defaults; otherwise upstream unlimited defaults are assumed.").Envar("QUOTA_DEFAULTS_FILE").String()
+	cinderQuotaQueryTimeout = kingpin.Flag("cinder.quota-query-timeout", "Shared deadline for Cinder quota SQL reads; must be positive and shorter than the scrape timeout.").Default("5s").Envar("CINDER_QUOTA_QUERY_TIMEOUT").Duration()
+	quotaQueryTimeout       = kingpin.Flag("octavia.quota-query-timeout", "Shared deadline for Octavia quota database queries; must be positive and shorter than the scrape timeout.").Default("5s").Envar("OCTAVIA_QUOTA_QUERY_TIMEOUT").Duration()
+	quotaDefaultsFile       = kingpin.Flag("quota.defaults-file", "Optional JSON file containing complete quota defaults for enabled Octavia and Cinder services; otherwise each service's upstream 2025.2 defaults are assumed.").Envar("QUOTA_DEFAULTS_FILE").String()
 
 	metricsPath = kingpin.Flag(
 		"web.telemetry-path",
@@ -104,8 +107,15 @@ func main() {
 	if *octaviaDatabaseURL != "" && *quotaDefaultsFile == "" {
 		logger.Warn("No Octavia quota defaults file configured; assuming Octavia 2025.2 upstream unlimited (-1) defaults")
 	}
+	cinderDefaults, err := loadCinderQuotaConfig(*cinderDatabaseURL, *quotaDefaultsFile, *cinderQuotaQueryTimeout, logger)
+	if err != nil {
+		logger.Error("Invalid Cinder quota configuration", "error", err)
+		os.Exit(1)
+	}
 	reg := collector.NewRegistry(collector.Config{
 		CinderDatabaseURL:        *cinderDatabaseURL,
+		CinderQuotaDefaults:      cinderDefaults,
+		CinderQuotaQueryTimeout:  *cinderQuotaQueryTimeout,
 		GlanceDatabaseURL:        *glanceDatabaseURL,
 		HeatDatabaseURL:          *heatDatabaseURL,
 		IronicDatabaseURL:        *ironicDatabaseURL,
@@ -158,6 +168,20 @@ func loadOctaviaQuotaConfig(databaseURL, defaultsFile string, timeout time.Durat
 	defaults, err := octavia.LoadQuotaDefaults(defaultsFile)
 	if err != nil {
 		return nil, fmt.Errorf("octavia quota defaults file %q: %w", defaultsFile, err)
+	}
+	return defaults, nil
+}
+
+func loadCinderQuotaConfig(databaseURL, defaultsFile string, timeout time.Duration, logger *slog.Logger) (*cinder.QuotaDefaults, error) {
+	if databaseURL == "" {
+		return nil, nil
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("cinder quota query timeout must be positive")
+	}
+	defaults, err := cinder.LoadQuotaDefaults(defaultsFile, logger)
+	if err != nil {
+		return nil, fmt.Errorf("cinder quota defaults file %q: %w", defaultsFile, err)
 	}
 	return defaults, nil
 }
