@@ -162,19 +162,53 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 		 ('sub-sp01', 'pool-subnet', 'net-001', 4, '10.200.0.0/26', '10.200.0.1', 1, 'proj-001', 'sp-001', 11)`,
 	)
 
-	// Octavia: amphorae, load balancers, VIPs, pools (including soft-deleted resources that should be filtered out)
+	// Distinct counts catch swapped resource labels. Every child has an existing
+	// parent, including deleted rows; health monitors use distinct pools.
 	itest.SeedSQL(t, octaviaRes.DB,
-		`INSERT INTO amphora (id, compute_id, status, load_balancer_id, lb_network_ip, ha_ip, role, cert_expiration, cert_busy) VALUES
-		 ('amp-001', 'compute-001', 'READY', 'lb-001', '10.0.0.1', '10.0.0.2', 'MASTER', '2025-12-31 23:59:59', 0),
-		 ('amp-del', 'compute-del', 'DELETED', 'lb-del', '10.0.0.99', '10.0.0.98', 'MASTER', '2024-01-01 00:00:00', 0)`,
 		`INSERT INTO load_balancer (id, project_id, name, provisioning_status, operating_status, enabled, provider) VALUES
-		 ('lb-001', 'proj-abc', 'web-lb', 'ACTIVE', 'ONLINE', 1, 'octavia'),
-		 ('lb-del', 'proj-abc', 'deleted-lb', 'DELETED', 'OFFLINE', 0, 'octavia')`,
-		`INSERT INTO vip (load_balancer_id, ip_address) VALUES ('lb-001', '203.0.113.50')`,
-		`INSERT INTO pool (id, project_id, name, protocol, lb_algorithm, operating_status, enabled, load_balancer_id, provisioning_status) VALUES
-		 ('pool-001', 'proj-abc', 'http-pool', 'HTTP', 'ROUND_ROBIN', 'ONLINE', 1, 'lb-001', 'ACTIVE'),
-		 ('pool-del', 'proj-abc', 'deleted-pool', 'TCP', 'ROUND_ROBIN', 'OFFLINE', 0, 'lb-del', 'DELETED')`,
+ ('lb-001','proj-abc','web-lb','ACTIVE','ONLINE',1,'octavia'),
+ ('lb-del','proj-abc','deleted-lb','DELETED','OFFLINE',0,'octavia')`,
+		`INSERT INTO amphora (id, compute_id, status, load_balancer_id, lb_network_ip, ha_ip, role, cert_expiration, cert_busy) VALUES
+ ('amp-001', 'compute-001', 'READY', 'lb-001', '10.0.0.1', '10.0.0.2', 'MASTER', '2025-12-31 23:59:59', 0),
+ ('amp-del', 'compute-del', 'DELETED', 'lb-del', '10.0.0.99', '10.0.0.98', 'MASTER', '2024-01-01 00:00:00', 0)`,
+		`INSERT INTO vip (load_balancer_id, ip_address) VALUES ('lb-001','203.0.113.50')`,
+		`INSERT INTO quotas (project_id,load_balancer,listener,pool,member,health_monitor,l7policy,l7rule)
+ VALUES ('proj-abc',10,0,NULL,-1,30,60,70)`,
 	)
+	for i := 1; i <= 5; i++ {
+		itest.SeedSQL(t, octaviaRes.DB, fmt.Sprintf(`INSERT INTO pool (id,project_id,name,protocol,lb_algorithm,operating_status,enabled,load_balancer_id,provisioning_status)
+ VALUES ('pool-%d','proj-abc','pool-%d','HTTP','ROUND_ROBIN','ONLINE',1,'lb-001','ACTIVE')`, i, i))
+	}
+	itest.SeedSQL(t, octaviaRes.DB, `INSERT INTO pool (id,project_id,protocol,lb_algorithm,operating_status,enabled,load_balancer_id,provisioning_status)
+ VALUES ('pool-del','proj-abc','HTTP','ROUND_ROBIN','OFFLINE',0,'lb-del','DELETED')`)
+	for i := 1; i <= 2; i++ {
+		itest.SeedSQL(t, octaviaRes.DB, fmt.Sprintf(`INSERT INTO listener (id,project_id,protocol,protocol_port,load_balancer_id,provisioning_status)
+ VALUES ('listener-%d','proj-abc','HTTP',%d,'lb-001','ACTIVE')`, i, 80+i))
+	}
+	itest.SeedSQL(t, octaviaRes.DB, `INSERT INTO listener (id,project_id,protocol,protocol_port,load_balancer_id,provisioning_status)
+ VALUES ('listener-del','proj-abc','HTTP',80,'lb-del','DELETED')`)
+	for _, resource := range []struct {
+		table, parentTable, parentColumn string
+		count                            int
+	}{
+		{"member", "pool", "pool_id", 4},
+		{"health_monitor", "pool", "pool_id", 3},
+		{"l7policy", "listener", "listener_id", 6},
+		{"l7rule", "l7policy", "l7policy_id", 7},
+	} {
+		for i := 1; i <= resource.count; i++ {
+			parent := resource.parentTable + "-1"
+			if resource.table == "health_monitor" {
+				parent = fmt.Sprintf("pool-%d", i)
+			}
+			status := "ACTIVE"
+			if i == resource.count {
+				status = "ERROR"
+			} // Non-DELETED states still consume quota.
+			itest.SeedSQL(t, octaviaRes.DB, fmt.Sprintf("INSERT INTO %s (id,project_id,%s,provisioning_status) VALUES ('%s-%d','proj-abc','%s','%s')", resource.table, resource.parentColumn, resource.table, i, parent, status))
+		}
+		itest.SeedSQL(t, octaviaRes.DB, fmt.Sprintf("INSERT INTO %s (id,project_id,%s,provisioning_status) VALUES ('%s-del','proj-abc','%s-del','DELETED')", resource.table, resource.parentColumn, resource.table, resource.parentTable))
+	}
 
 	// Placement: resource providers, classes, inventories, allocations, projects, users, consumers
 	itest.SeedSQL(t, placementRes.DB,
@@ -360,9 +394,24 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 	assertMetricExists(t, families, "openstack_neutron_quota_network")
 
 	// Octavia
+	assertGaugeValue(t, families, "openstack_loadbalancer_quota_up", 1)
+	for _, quota := range []struct {
+		resource     string
+		usage, limit float64
+	}{
+		{"loadbalancer", 1, 10}, {"listener", 2, 0}, {"pool", 5, -1}, {"member", 4, -1},
+		{"healthmonitor", 3, 30}, {"l7policy", 6, 60}, {"l7rule", 7, 70},
+	} {
+		name := "openstack_loadbalancer_quota_" + quota.resource
+		assertQuotaValue(t, families, name, "proj-abc", "in_use", quota.usage)
+		assertQuotaValue(t, families, name, "proj-abc", "limit", quota.limit)
+		// The Keystone project is idle in Octavia and has upstream defaults.
+		assertQuotaValue(t, families, name, "proj-001", "in_use", 0)
+		assertQuotaValue(t, families, name, "proj-001", "limit", -1)
+	}
 	assertGaugeValue(t, families, "openstack_loadbalancer_total_amphorae", 1)
 	assertGaugeValue(t, families, "openstack_loadbalancer_total_loadbalancers", 1)
-	assertGaugeValue(t, families, "openstack_loadbalancer_total_pools", 1)
+	assertGaugeValue(t, families, "openstack_loadbalancer_total_pools", 5)
 	assertMetricExists(t, families, "openstack_loadbalancer_amphora_status")
 	assertMetricExists(t, families, "openstack_loadbalancer_loadbalancer_status")
 	assertMetricExists(t, families, "openstack_loadbalancer_pool_status")
@@ -754,5 +803,31 @@ func assertGaugeValue(t *testing.T, families map[string]*dto.MetricFamily, name 
 			actual = m.GetUntyped().GetValue()
 		}
 		t.Errorf("metric %s: expected value %v, got %v", name, expected, actual)
+	}
+}
+
+// Match the project and measurement so another project's value cannot pass.
+func assertQuotaValue(t *testing.T, families map[string]*dto.MetricFamily, name, projectID, kind string, expected float64) {
+	t.Helper()
+	family, ok := families[name]
+	if !ok {
+		t.Errorf("missing metric %s", name)
+		return
+	}
+	matches := 0
+	for _, metric := range family.Metric {
+		labels := map[string]string{}
+		for _, label := range metric.Label {
+			labels[label.GetName()] = label.GetValue()
+		}
+		if labels["tenant_id"] == projectID && labels["type"] == kind {
+			matches++
+			if metric.Gauge == nil || metric.GetGauge().GetValue() != expected {
+				t.Errorf("%s project=%s type=%s: got %v, want %v", name, projectID, kind, metric.GetGauge(), expected)
+			}
+		}
+	}
+	if matches != 1 {
+		t.Errorf("%s project=%s type=%s: got %d samples, want 1", name, projectID, kind, matches)
 	}
 }

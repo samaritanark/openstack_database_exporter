@@ -1,9 +1,12 @@
 package octavia
 
 import (
+	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/vexxhost/openstack_database_exporter/internal/collector/project"
 	"github.com/vexxhost/openstack_database_exporter/internal/util"
 	db "github.com/vexxhost/openstackdb"
 )
@@ -13,7 +16,7 @@ const (
 	Subsystem = "loadbalancer"
 )
 
-func RegisterCollectors(registry *prometheus.Registry, databaseURL string, logger *slog.Logger) {
+func RegisterCollectors(registry *prometheus.Registry, databaseURL string, projectResolver *project.Resolver, defaults QuotaDefaults, logger *slog.Logger, queryTimeout time.Duration) {
 	if databaseURL == "" {
 		logger.Info("Collector not loaded", "service", "octavia", "reason", "database URL not configured")
 		return
@@ -21,14 +24,16 @@ func RegisterCollectors(registry *prometheus.Registry, databaseURL string, logge
 
 	conn, err := db.Connect(databaseURL)
 	if err != nil {
-		logger.Error("Failed to connect to database", "service", "octavia", "error", err)
+		logger.Error("Failed to connect to database", "service", "octavia", "error_type", fmt.Sprintf("%T", err))
 		registry.MustRegister(util.NewDownCollector(Namespace, Subsystem))
+		registry.MustRegister(util.NewDownCollector(Namespace, Subsystem+"_quota"))
 		return
 	}
 
 	registry.MustRegister(NewAmphoraCollector(conn, logger))
 	registry.MustRegister(NewLoadBalancerCollector(conn, logger))
 	registry.MustRegister(NewPoolCollector(conn, logger))
+	registry.MustRegister(NewQuotasCollector(conn, logger, projectResolver, defaults, queryTimeout))
 
 	logger.Info("Registered collectors", "service", "octavia")
 }

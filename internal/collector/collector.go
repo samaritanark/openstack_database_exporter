@@ -36,10 +36,13 @@ type Config struct {
 	ManilaDatabaseURL    string
 	NeutronDatabaseURL   string
 	OctaviaDatabaseURL   string
-	PlacementDatabaseURL string
-	NovaDatabaseURL      string
-	NovaAPIDatabaseURL   string
-	ProjectCacheTTL      time.Duration
+	OctaviaQuotaDefaults octavia.QuotaDefaults
+	// Zero uses the default five-second shared quota query deadline.
+	OctaviaQuotaQueryTimeout time.Duration
+	PlacementDatabaseURL     string
+	NovaDatabaseURL          string
+	NovaAPIDatabaseURL       string
+	ProjectCacheTTL          time.Duration
 }
 
 func NewRegistry(cfg Config, logger *slog.Logger) *prometheus.Registry {
@@ -68,7 +71,7 @@ func NewRegistry(cfg Config, logger *slog.Logger) *prometheus.Registry {
 	manila.RegisterCollectors(reg, cfg.ManilaDatabaseURL, logger)
 	neutron.RegisterCollectors(reg, cfg.NeutronDatabaseURL, projectResolver, logger)
 	nova.RegisterCollectors(reg, cfg.NovaDatabaseURL, cfg.NovaAPIDatabaseURL, cfg.PlacementDatabaseURL, projectResolver, logger)
-	octavia.RegisterCollectors(reg, cfg.OctaviaDatabaseURL, logger)
+	octavia.RegisterCollectors(reg, cfg.OctaviaDatabaseURL, projectResolver, cfg.OctaviaQuotaDefaults, logger, cfg.OctaviaQuotaQueryTimeout)
 	placement.RegisterCollectors(reg, cfg.PlacementDatabaseURL, logger)
 
 	return reg
