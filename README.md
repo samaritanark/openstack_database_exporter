@@ -116,3 +116,133 @@ These metrics require the public [openstackdb Octavia quota APIs](https://github
 That contribution is awaiting acceptance upstream; the tracked v0.2.1 dependency
 does not contain these APIs. Builds and tests currently require a temporary Go
 workspace selecting that public library source alongside this exporter.
+
+## Cinder quotas
+
+Cinder quota collection uses SELECT-only `openstackdb` repository reads. Supply
+Cinder and Keystone database URLs with read-only credentials for project names
+and `domain_id` labels. Without Keystone metadata, `tenant` falls back to
+the project ID and `domain_id` is empty. All DB-discovered projects, including
+usage-only projects, and cached Keystone projects are included.
+
+Set `--cinder.quota-query-timeout` / `CINDER_QUOTA_QUERY_TIMEOUT` (default `5s`)
+shorter than the scrape timeout. All quota SQL reads share this deadline.
+`openstack_cinder_quota_up=1` indicates successful collection, not necessarily
+complete coverage of every individual quota scope. Isolated malformed records
+are logged and omitted as described below. Database query failures, timeouts,
+and unrecoverable global errors fail closed: quota_up is 0 with no quota data.
+The existing `openstack_cinder_up` inventory health gauge remains separate.
+The existing resolver's Keystone refresh is separate from this SQL deadline.
+
+Add a complete `cinder` section to `--quota.defaults-file` / `QUOTA_DEFAULTS_FILE`:
+
+```json
+{
+  "cinder": {
+    "volumes": 10,
+    "snapshots": 10,
+    "backups": 10,
+    "groups": 10,
+    "gigabytes": 1000,
+    "backup_gigabytes": 1000,
+    "per_volume_gigabytes": -1,
+    "use_default_quota_class": true
+  }
+}
+```
+
+These are upstream 2025.2 configuration defaults; mirror any customized Cinder
+settings (`per_volume_gigabytes` corresponds to `per_volume_size_limit`). Existing
+Octavia files remain valid: absent Cinder settings select upstream defaults
+with a warning. `use_default_quota_class` is optional and defaults to true.
+Project overrides take precedence over the active `default` quota-class entries,
+then deployment defaults. Set the switch false to mirror Cinder's corresponding
+option. Type resources default independently to -1, rather than inheriting the
+aggregate project limit. Request-context custom quota classes and alternative
+quota drivers cannot be inferred from the database; this collector models the
+standard DbQuotaDriver with no custom request-context quota class.
+
+All quota data has `tenant,tenant_id,domain_id`; type data also has `volume_type`
+(the full type name). **Compatibility:** `domain_id` is added to existing Cinder
+quota/capacity metrics, preserving `tenant` and `tenant_id`; inventory labels are
+unchanged. The metric families below have the `openstack_cinder_` prefix:
+
+| Families | Measurements |
+| --- | --- |
+| `quota_volumes`, `quota_snapshots`, `quota_backups`, `quota_groups` | `type=limit,in_use,reserved` |
+| `quota_per_volume_bytes` | `type=limit` only |
+| `limits_volume_max_bytes`, `limits_volume_used_bytes`, `limits_volume_reserved_bytes` | Aggregate byte limit, in-use and reserved |
+| `limits_backup_max_bytes`, `limits_backup_used_bytes`, `limits_backup_reserved_bytes` | Backup byte limit, in-use and reserved |
+| `volume_type_quota_volumes`, `volume_type_quota_snapshots` | `type=limit,in_use,reserved` |
+| `volume_type_quota_bytes` | Type byte limit |
+| `volume_type_quota_in_use_bytes`, `volume_type_quota_reserved_bytes` | Type byte usage and reservations |
+
+No duplicate project capacity quota families are emitted. New type measurements
+cover project/type scopes observed in active overrides or accounting; only the
+existing type gigabyte limit preserves its legacy project × active-type series.
+For P projects, T active types and S observed project/type scopes, the maximum
+series count is `19P + P*T + 8S + 1`. Active type names are resolved without
+splitting underscores; deleted types are excluded. No type ID label is added,
+which preserves the existing type identity label contract.
+
+Usage and reservations are the recorded enforcement accounting, not physical
+backend consumption. Aggregate bytes normally include volumes **and**
+snapshots; `no_snapshot_gb_quota` changes Cinder's accounting, which the exporter
+reads as maintained. Type and aggregate measurements overlap: do not add them.
+Reservations are not additionally summed from reservation records or expired by
+the exporter. Independent SQL reads are not an atomic quota-check transaction.
+
+Zero limits are preserved; -1 means unlimited. The project's NULL override falls
+through to defaults, as in `DbQuotaDriver.get_project_quotas`; a NULL default-class
+limit cannot supply a valid inherited limit. Invalid or duplicate default-class
+records omit only dependent limits; explicit valid project overrides and recorded
+accounting remain available. NULL or empty default resource names are ignored.
+NULL/empty volume-type names and duplicate active names omit the affected types.
+No ambiguous record is selected and no invalid limit is replaced by zero or a
+configuration fallback. Duplicate project/resource limits or usage omit only the
+affected scope; other valid metrics remain available. Negative `in_use` and
+`reserved` counters remain signed and capacity values scale to bytes. Malformed project identities and
+project limits below -1 still fail collection.
+Active rows use Cinder's Boolean `deleted=0`.
+
+For alerts, use `(in_use + reserved) / limit` only for positive finite limits,
+and gate on quota health; zero and unlimited limits need separate handling.
+Aggregate project usage by domain once, choosing a single exporter source where
+API and DB exporters expose identical capacity names. Summed project limits are
+allocated project quotas, not a shared domain enforcement limit.
+
+Semantics were checked against release-tagged Cinder 27.0.0 (2025.2):
+[quota engines/defaults](https://github.com/openstack/cinder/blob/27.0.0/cinder/quota.py),
+[accounting and synchronization](https://github.com/openstack/cinder/blob/27.0.0/cinder/db/sqlalchemy/api.py),
+and [models](https://github.com/openstack/cinder/blob/27.0.0/cinder/db/sqlalchemy/models.py).
+Model comments calling NULL unlimited conflict with the actual driver path;
+the behavior above follows that path. Quota values are never repaired.
+
+
+### Cinder capacity migration
+
+This change removes six existing capacity family names without aliases or dual
+emission. Update dashboards, recording rules and alerts to the following names.
+All numeric capacities use bytes: source GiB × 1073741824 (2^30). Conversion
+uses floating point before multiplication. Only unlimited quota **limits** retain
+`-1`; signed usage, reservations and inventory values scale normally.
+
+| Previous family | Byte family |
+| --- | --- |
+| `openstack_cinder_limits_volume_max_gb` | `openstack_cinder_limits_volume_max_bytes` |
+| `openstack_cinder_limits_volume_used_gb` | `openstack_cinder_limits_volume_used_bytes` |
+| `openstack_cinder_limits_backup_max_gb` | `openstack_cinder_limits_backup_max_bytes` |
+| `openstack_cinder_limits_backup_used_gb` | `openstack_cinder_limits_backup_used_bytes` |
+| `openstack_cinder_volume_type_quota_gigabytes` | `openstack_cinder_volume_type_quota_bytes` |
+| `openstack_cinder_volume_gb` | `openstack_cinder_volume_bytes` |
+
+The first five families also gain `domain_id` alongside their existing identity
+labels. This changes series identity; adjust aggregations and joins accordingly.
+The new capacity families `openstack_cinder_limits_volume_reserved_bytes`,
+`openstack_cinder_limits_backup_reserved_bytes`,
+`openstack_cinder_quota_per_volume_bytes`,
+`openstack_cinder_volume_type_quota_in_use_bytes` and
+`openstack_cinder_volume_type_quota_reserved_bytes` are introduced directly in
+bytes. Configuration and SQL resource keys still use `gigabytes`, and the
+`openstack_cinder_volume_status` **size label stays in GiB**. Volume inventory
+keeps its existing labels and attachment-row behavior.

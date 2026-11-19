@@ -27,16 +27,18 @@ const (
 )
 
 type Config struct {
-	CinderDatabaseURL    string
-	GlanceDatabaseURL    string
-	HeatDatabaseURL      string
-	IronicDatabaseURL    string
-	KeystoneDatabaseURL  string
-	MagnumDatabaseURL    string
-	ManilaDatabaseURL    string
-	NeutronDatabaseURL   string
-	OctaviaDatabaseURL   string
-	OctaviaQuotaDefaults octavia.QuotaDefaults
+	CinderDatabaseURL       string
+	CinderQuotaDefaults     *cinder.QuotaDefaults
+	CinderQuotaQueryTimeout time.Duration
+	GlanceDatabaseURL       string
+	HeatDatabaseURL         string
+	IronicDatabaseURL       string
+	KeystoneDatabaseURL     string
+	MagnumDatabaseURL       string
+	ManilaDatabaseURL       string
+	NeutronDatabaseURL      string
+	OctaviaDatabaseURL      string
+	OctaviaQuotaDefaults    octavia.QuotaDefaults
 	// Zero uses the default five-second shared quota query deadline.
 	OctaviaQuotaQueryTimeout time.Duration
 	PlacementDatabaseURL     string
@@ -62,7 +64,7 @@ func NewRegistry(cfg Config, logger *slog.Logger) *prometheus.Registry {
 	}
 	projectResolver := project.NewResolver(logger, keystoneQueries, cfg.ProjectCacheTTL)
 
-	cinder.RegisterCollectors(reg, cfg.CinderDatabaseURL, projectResolver, logger)
+	cinder.RegisterCollectors(reg, cfg.CinderDatabaseURL, projectResolver, logger, cinder.QuotaOptions{Defaults: cfg.CinderQuotaDefaults, QueryTimeout: cfg.CinderQuotaQueryTimeout})
 	glance.RegisterCollectors(reg, cfg.GlanceDatabaseURL, logger)
 	heat.RegisterCollectors(reg, cfg.HeatDatabaseURL, logger)
 	ironic.RegisterCollectors(reg, cfg.IronicDatabaseURL, logger)

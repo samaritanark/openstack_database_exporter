@@ -19,9 +19,9 @@ var (
 		nil,
 	)
 
-	volumeGbDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(Namespace, Subsystem, "volume_gb"),
-		"volume_gb",
+	volumeBytesDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(Namespace, Subsystem, "volume_bytes"),
+		"Volume provisioned size in bytes (source GiB multiplied by 2^30).",
 		[]string{
 			"id",
 			"name",
@@ -89,7 +89,7 @@ func NewVolumesCollector(db *sql.DB, logger *slog.Logger) *VolumesCollector {
 
 func (c *VolumesCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- volumesDesc
-	ch <- volumeGbDesc
+	ch <- volumeBytesDesc
 	ch <- volumeStatusDesc
 	ch <- volumeStatusCounterDesc
 	ch <- volumesUpDesc
@@ -133,9 +133,9 @@ func (c *VolumesCollector) Collect(ch chan<- prometheus.Metric) {
 		volume_status_counter[volume.Status.String]++
 
 		ch <- prometheus.MustNewConstMetric(
-			volumeGbDesc,
+			volumeBytesDesc,
 			prometheus.GaugeValue,
-			float64(volume.Size.Int32),
+			float64(volume.Size.Int32)*(1<<30),
 			volume.ID,
 			volume.Name.String,
 			volume.Status.String,

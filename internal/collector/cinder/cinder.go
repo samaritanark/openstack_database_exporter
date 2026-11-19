@@ -14,7 +14,7 @@ const (
 	Subsystem = "cinder"
 )
 
-func RegisterCollectors(registry *prometheus.Registry, databaseURL string, projectResolver *project.Resolver, logger *slog.Logger) {
+func RegisterCollectors(registry *prometheus.Registry, databaseURL string, projectResolver *project.Resolver, logger *slog.Logger, options ...QuotaOptions) {
 	if databaseURL == "" {
 		logger.Info("Collector not loaded", "service", "cinder", "reason", "database URL not configured")
 		return
@@ -22,13 +22,14 @@ func RegisterCollectors(registry *prometheus.Registry, databaseURL string, proje
 
 	conn, err := db.Connect(databaseURL)
 	if err != nil {
-		logger.Error("Failed to connect to database", "service", "cinder", "error", err)
+		logger.Error("Failed to connect to database", append([]any{"service", "cinder", "operation", "connect"}, cinderErrorAttrs(err)...)...)
 		registry.MustRegister(util.NewDownCollector(Namespace, Subsystem))
+		registry.MustRegister(util.NewDownCollector(Namespace, Subsystem+"_quota"))
 		return
 	}
 
 	registry.MustRegister(NewAgentsCollector(conn, logger))
-	registry.MustRegister(NewLimitsCollector(conn, logger, projectResolver))
+	registry.MustRegister(NewQuotasCollector(conn, logger, projectResolver, options...))
 	registry.MustRegister(NewSnapshotsCollector(conn, logger))
 	registry.MustRegister(NewVolumesCollector(conn, logger))
 
