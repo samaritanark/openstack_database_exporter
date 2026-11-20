@@ -1,2 +1,4 @@
 /openstack-database-exporter
 exporter.sh
+/local/*
+!/local/.gitignore
