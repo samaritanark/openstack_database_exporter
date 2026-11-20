@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -15,12 +16,14 @@ import (
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 
 	"github.com/vexxhost/openstack_database_exporter/internal/collector"
+	"github.com/vexxhost/openstack_database_exporter/internal/collector/neutron"
 	"github.com/vexxhost/openstack_database_exporter/internal/collector/octavia"
 )
 
 var (
-	quotaQueryTimeout = kingpin.Flag("octavia.quota-query-timeout", "Shared deadline for Octavia quota database queries; must be positive and shorter than the scrape timeout.").Default("5s").Envar("OCTAVIA_QUOTA_QUERY_TIMEOUT").Duration()
-	quotaDefaultsFile = kingpin.Flag("quota.defaults-file", "Optional JSON file containing all seven Octavia quota defaults; otherwise upstream unlimited defaults are assumed.").Envar("QUOTA_DEFAULTS_FILE").String()
+	neutronQuotaQueryTimeout = kingpin.Flag("neutron.quota-query-timeout", "Shared deadline for Neutron quota reads; must be positive and shorter than the scrape timeout.").Default("5s").Envar("NEUTRON_QUOTA_QUERY_TIMEOUT").Duration()
+	quotaQueryTimeout        = kingpin.Flag("octavia.quota-query-timeout", "Shared deadline for Octavia quota database queries; must be positive and shorter than the scrape timeout.").Default("5s").Envar("OCTAVIA_QUOTA_QUERY_TIMEOUT").Duration()
+	quotaDefaultsFile        = kingpin.Flag("quota.defaults-file", "Optional JSON file containing quota defaults for enabled Octavia and Neutron services; otherwise service defaults are assumed.").Envar("QUOTA_DEFAULTS_FILE").String()
 
 	metricsPath = kingpin.Flag(
 		"web.telemetry-path",
@@ -104,6 +107,7 @@ func main() {
 	if *octaviaDatabaseURL != "" && *quotaDefaultsFile == "" {
 		logger.Warn("No Octavia quota defaults file configured; assuming Octavia 2025.2 upstream unlimited (-1) defaults")
 	}
+	neutronOptions := loadNeutronQuotaConfig(*neutronDatabaseURL, *quotaDefaultsFile, *neutronQuotaQueryTimeout, logger)
 	reg := collector.NewRegistry(collector.Config{
 		CinderDatabaseURL:        *cinderDatabaseURL,
 		GlanceDatabaseURL:        *glanceDatabaseURL,
@@ -113,6 +117,7 @@ func main() {
 		MagnumDatabaseURL:        *magnumDatabaseURL,
 		ManilaDatabaseURL:        *manilaDatabaseURL,
 		NeutronDatabaseURL:       *neutronDatabaseURL,
+		NeutronQuotaOptions:      neutronOptions,
 		OctaviaDatabaseURL:       *octaviaDatabaseURL,
 		OctaviaQuotaDefaults:     quotaDefaults,
 		OctaviaQuotaQueryTimeout: *quotaQueryTimeout,
@@ -160,4 +165,19 @@ func loadOctaviaQuotaConfig(databaseURL, defaultsFile string, timeout time.Durat
 		return nil, fmt.Errorf("octavia quota defaults file %q: %w", defaultsFile, err)
 	}
 	return defaults, nil
+}
+
+// Invalid Neutron configuration leaves the exporter running with quota_up=0.
+func loadNeutronQuotaConfig(databaseURL, defaultsFile string, timeout time.Duration, logger *slog.Logger) neutron.QuotaOptions {
+	opts := neutron.QuotaOptions{QueryTimeout: timeout}
+	if databaseURL == "" {
+		return opts
+	}
+	if timeout <= 0 {
+		opts.ConfigError = fmt.Errorf("neutron quota query timeout must be positive")
+		logger.Error("Invalid Neutron quota configuration", "service", "neutron", "source", "neutron.quota-query-timeout", "reason", "must be positive")
+		return opts
+	}
+	opts.Defaults, opts.ConfigError = neutron.LoadQuotaDefaults(defaultsFile, logger)
+	return opts
 }

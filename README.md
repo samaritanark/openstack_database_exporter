@@ -116,3 +116,99 @@ These metrics require the public [openstackdb Octavia quota APIs](https://github
 That contribution is awaiting acceptance upstream; the tracked v0.2.1 dependency
 does not contain these APIs. Builds and tests currently require a temporary Go
 workspace selecting that public library source alongside this exporter.
+
+### Neutron project quotas
+
+
+The existing `openstack_neutron_quota_floatingip`, `quota_router`,
+`quota_network`, `quota_port`, `quota_security_group`, and
+`quota_security_group_rule` families report `type="limit|used|reserved"` (each
+suffix has the `openstack_neutron_` prefix). All quota families now have
+`tenant,tenant_id,domain_id,type` labels. The original Neutron `type="used"`
+convention is preserved for all nine families, without aliases. Additional
+identity labels change series identity: review exact label matching, joins,
+aggregations and recording rules, even where existing `type="used"` selectors
+still work. Group by `tenant_id` for project identity and `domain_id` for domain
+attribution. Names are not unique. Unknown Keystone owners retain their project
+ID as `tenant` and an empty `domain_id`; no domain is inferred from a name.
+
+This implementation assumes **Neutron 2025.2 DbQuotaNoLockDriver**. Usage counts
+rows owned directly by each project; reservations sum active joined
+`reservations`/`resourcedeltas` rows with `expiration >=` one UTC database-clock cutoff per scrape.
+Expired and NULL-expiration reservations are excluded. Multiple expiration
+groups contribute to the same total, matching corrected 27.0.4 aggregation.
+It does not use `quotausages` or support legacy/null/custom driver accounting.
+Separate SQL reads can race with mutations.
+
+Extend the shared `--quota.defaults-file` JSON with:
+
+```json
+{"neutron":{"floatingip":50,"router":10,"network":100,"port":500,"security_group":10,"security_group_rule":100}}
+```
+
+A supplied `neutron` section requires these six integer values and optionally
+accepts `subnet`, `subnetpool`, and `rbac_policy`. When omitted, these optional
+defaults are `100`, `-1` (the upstream global `default_quota`), and `10`,
+respectively. Existing six-key files remain valid. NULLs, missing required keys,
+duplicate keys, trailing content, unknown resources and non-integers are
+invalid. Zero is valid; negative configured defaults normalize to unlimited `-1`
+as in Neutron. If no section/file is supplied, the collector logs its upstream
+2025.2 default assumption (values shown above). Project overrides take
+precedence, including zero and recorded negative limits. These defaults are
+independent of other services. SQL alone cannot discover deployment
+configuration.
+
+`--neutron.quota-query-timeout` (`NEUTRON_QUOTA_QUERY_TIMEOUT`, default `5s`)
+provides a positive shared deadline for quota SQL reads. Optional metadata
+refresh is bounded by the remaining time in that deadline. Set it below the
+scrape timeout. `openstack_neutron_quota_up` is 1 only after required SQL reads
+succeed; query, timeout or global configuration failures emit only quota health
+0. Isolated malformed records omit affected scopes with health 1. It remains
+registered after a connection failure, separately from inventory
+`openstack_neutron_up`. Missing metadata uses cached data or project-ID
+fallback; refresh failures are logged without database error text. Metadata
+freshness is not certified by quota health. A metadata refresh that exhausts the
+remaining deadline does not discard valid quota samples or set quota health to
+0. Invalid defaults or timeout settings are logged once at startup with
+structured source, known key and reason fields; raw configuration, file paths,
+unknown key text and driver errors are not logged. Invalid Neutron-section
+defaults or timeout settings leave unrelated metrics operational. Shared-file
+parsing failures may still prevent startup when another service rejects the
+file.
+
+Supported-resource NULL overrides, duplicate project/resource quota or usage records, duplicate reservation
+deltas, invalid reservation amounts and negative usage/reservation values omit all three
+measurements for the affected `(project_id, resource)`. Neutron applies stored
+NULL overrides directly; they do not imply inheritance. Zero and negative
+(unlimited) limits remain valid. Missing owners conservatively omit the affected
+resource across projects; missing resources omit that owner's resources. If
+neither identifier is usable, all quota scopes are omitted. Later records cannot
+restore invalidated scopes. Unknown extension resources are ignored for accounting
+but their owners are discovered. Successful empty SQL results establish legitimate
+zero usage/reservations. All nine resources, including `subnet`, `subnetpool` and
+`rbac_policy`, report actual active reservations (27 series per healthy project).
+
+`openstack_neutron_quota_skipped_records` is an unlabeled gauge emitted on
+successful SQL collection, including zero on clean scrapes. It counts returned
+records that fail validation, including each extra duplicate row; an invalid
+usage aggregate counts once; each malformed raw reservation delta counts once. The first
+otherwise valid row in an ambiguous group is not counted again. It does not count
+omitted metric samples, SQL-filtered records, metadata failures or unsupported
+extensions. It is absent when collection fails globally. Warnings use controlled
+reasons, allowlisted resource names and hashed owner identifiers, with at most one
+warning per reason per scrape.
+
+Neutron stores naive UTC expiration timestamps. The reservation query uses
+`UTC_TIMESTAMP()` once per statement, independently of the exporter clock and
+connection location. Explicitly empty usage and reservation owners are
+system-owned and are skipped. NULL and whitespace owners returned by SQL
+remain invalid; SQL-filtered records are not counted as skipped.
+
+Metadata fallback can temporarily change series identity until Keystone enrichment
+succeeds. Validate dashboard queries and alerts against the new identity labels
+before production rollout.
+
+Before rollout, confirm the deployed driver, effective defaults, enabled resource
+plugins, reservation schema, Keystone access, query plans and API patch version.
+Do not sum unlimited limits as finite capacity. Use one authoritative quota
+exporter target to avoid double counting overlapping API/database metrics.

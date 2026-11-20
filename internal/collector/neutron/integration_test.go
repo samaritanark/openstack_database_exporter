@@ -35,13 +35,12 @@ func TestIntegration_AgentsCollector(t *testing.T) {
 	})
 
 	t.Run("with agents alive and dead", func(t *testing.T) {
-		now := time.Now().Format("2006-01-02 15:04:05")
-
+		// Use the database clock, matching GetAgents' heartbeat comparison with NOW().
 		itest.SeedSQL(t, db,
-			fmt.Sprintf("INSERT INTO agents (id, agent_type, `binary`, topic, host, admin_state_up, created_at, started_at, heartbeat_timestamp, configurations) VALUES"+
-				" ('ag-001', 'L3 agent', 'neutron-l3-agent', 'l3_agent', 'ctrl-01', 1, '%s', '%s', '%s', '{}')", now, now, now),
-			fmt.Sprintf("INSERT INTO agents (id, agent_type, `binary`, topic, host, admin_state_up, created_at, started_at, heartbeat_timestamp, configurations, availability_zone) VALUES"+
-				" ('ag-002', 'DHCP agent', 'neutron-dhcp-agent', 'dhcp_agent', 'ctrl-02', 0, '%s', '%s', DATE_SUB(NOW(), INTERVAL 5 MINUTE), '{}', 'nova')", now, now),
+			"INSERT INTO agents (id, agent_type, `binary`, topic, host, admin_state_up, created_at, started_at, heartbeat_timestamp, configurations) VALUES"+
+				" ('ag-001', 'L3 agent', 'neutron-l3-agent', 'l3_agent', 'ctrl-01', 1, NOW(), NOW(), NOW(), '{}')",
+			"INSERT INTO agents (id, agent_type, `binary`, topic, host, admin_state_up, created_at, started_at, heartbeat_timestamp, configurations, availability_zone) VALUES"+
+				" ('ag-002', 'DHCP agent', 'neutron-dhcp-agent', 'dhcp_agent', 'ctrl-02', 0, NOW(), NOW(), DATE_SUB(NOW(), INTERVAL 5 MINUTE), '{}', 'nova')",
 		)
 
 		collector := NewAgentsCollector(db, logger)
@@ -494,8 +493,8 @@ func TestIntegration_QuotaCollector(t *testing.T) {
 		resolver := project.NewResolver(logger, nil, 0)
 		collector := NewQuotaCollector(db, logger, resolver)
 		count := testutil.CollectAndCount(collector)
-		if count != 0 {
-			t.Fatalf("expected 0 metrics for empty quotas, got %d", count)
+		if count != 2 {
+			t.Fatalf("expected quota health and skipped-record gauge for empty quotas, got %d", count)
 		}
 	})
 
@@ -521,18 +520,18 @@ func TestIntegration_QuotaCollector(t *testing.T) {
 		collector := NewQuotaCollector(db, logger, resolver)
 
 		// proj-001 should have: network limit=200 (explicit), router limit=20 (explicit),
-		// all others use defaults. 9 resources × 3 types (limit/reserved/used) = 27 metrics
+		// all others use defaults. 9 resources × 3 types (limit/reserved/used) = 27 metrics plus quota health and skipped-record gauge
 		count := testutil.CollectAndCount(collector)
-		if count != 27 {
-			t.Fatalf("expected 27 metrics (9 resources × 3 types), got %d", count)
+		if count != 29 {
+			t.Fatalf("expected 29 metrics (9 resources × 3 types plus health and skipped-record gauge), got %d", count)
 		}
 
 		// Verify explicit network quota
 		err := testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_neutron_quota_network quota_network
 # TYPE openstack_neutron_quota_network gauge
-openstack_neutron_quota_network{tenant="proj-001",type="limit"} 200
-openstack_neutron_quota_network{tenant="proj-001",type="reserved"} 0
-openstack_neutron_quota_network{tenant="proj-001",type="used"} 2
+openstack_neutron_quota_network{domain_id="",tenant="proj-001",tenant_id="proj-001",type="limit"} 200
+openstack_neutron_quota_network{domain_id="",tenant="proj-001",tenant_id="proj-001",type="reserved"} 0
+openstack_neutron_quota_network{domain_id="",tenant="proj-001",tenant_id="proj-001",type="used"} 2
 `), "openstack_neutron_quota_network")
 		if err != nil {
 			t.Fatalf("unexpected quota_network error: %v", err)
@@ -541,9 +540,9 @@ openstack_neutron_quota_network{tenant="proj-001",type="used"} 2
 		// Verify explicit router quota
 		err = testutil.CollectAndCompare(collector, strings.NewReader(`# HELP openstack_neutron_quota_router quota_router
 # TYPE openstack_neutron_quota_router gauge
-openstack_neutron_quota_router{tenant="proj-001",type="limit"} 20
-openstack_neutron_quota_router{tenant="proj-001",type="reserved"} 0
-openstack_neutron_quota_router{tenant="proj-001",type="used"} 1
+openstack_neutron_quota_router{domain_id="",tenant="proj-001",tenant_id="proj-001",type="limit"} 20
+openstack_neutron_quota_router{domain_id="",tenant="proj-001",tenant_id="proj-001",type="reserved"} 0
+openstack_neutron_quota_router{domain_id="",tenant="proj-001",tenant_id="proj-001",type="used"} 1
 `), "openstack_neutron_quota_router")
 		if err != nil {
 			t.Fatalf("unexpected quota_router error: %v", err)
