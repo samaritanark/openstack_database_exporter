@@ -119,9 +119,8 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 	)
 
 	// Neutron: agents, router bindings, routers, floating IPs, networks, subnets, ports, security groups, quotas
-	now := time.Now().Format("2006-01-02 15:04:05")
 	itest.SeedSQL(t, neutronRes.DB,
-		fmt.Sprintf("INSERT INTO agents (id, agent_type, `binary`, topic, host, admin_state_up, created_at, started_at, heartbeat_timestamp, configurations) VALUES ('agent-001', 'L3 agent', 'neutron-l3-agent', 'l3_agent', 'ctrl-01', 1, '%s', '%s', '%s', '{}')", now, now, now),
+		"INSERT INTO agents (id, agent_type, `binary`, topic, host, admin_state_up, created_at, started_at, heartbeat_timestamp, configurations) VALUES ('agent-001', 'L3 agent', 'neutron-l3-agent', 'l3_agent', 'ctrl-01', 1, NOW(), NOW(), NOW(), '{}')",
 		`INSERT INTO ha_router_agent_port_bindings (port_id, router_id, l3_agent_id, state) VALUES
 		 ('port-001', 'router-001', 'agent-001', 'active')`,
 		`INSERT INTO standardattributes (id, resource_type, created_at) VALUES
@@ -391,7 +390,13 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 	assertMetricExists(t, families, "openstack_neutron_subnets_total")
 	assertMetricExists(t, families, "openstack_neutron_subnets_free")
 	assertMetricExists(t, families, "openstack_neutron_subnets_used")
-	assertMetricExists(t, families, "openstack_neutron_quota_network")
+	assertGaugeValue(t, families, "openstack_neutron_quota_up", 1)
+	assertGaugeValue(t, families, "openstack_neutron_quota_skipped_records", 0)
+	for _, resource := range []string{"floatingip", "network", "port", "rbac_policy", "router", "security_group", "security_group_rule", "subnet", "subnetpool"} {
+		assertQuotaValue(t, families, "openstack_neutron_quota_"+resource, "proj-001", "reserved", 0)
+	}
+	assertQuotaValue(t, families, "openstack_neutron_quota_network", "proj-001", "limit", 200)
+	assertQuotaValue(t, families, "openstack_neutron_quota_network", "proj-001", "used", 2)
 
 	// Octavia
 	assertGaugeValue(t, families, "openstack_loadbalancer_quota_up", 1)
@@ -830,4 +835,101 @@ func assertQuotaValue(t *testing.T, families map[string]*dto.MetricFamily, name,
 	if matches != 1 {
 		t.Errorf("%s project=%s type=%s: got %d samples, want 1", name, projectID, kind, matches)
 	}
+}
+
+// Exercise raw reservation accounting through the production registry and HTTP
+// handler. Expirations use the database clock, with a wide deterministic margin.
+func TestIntegration_E2E_NeutronReservations(t *testing.T) {
+	itest.SkipIfNoDocker(t)
+	res := itest.NewMySQLContainerWithURL(t, "neutron-reservations", "../../sql/neutron/schema.sql")
+	resources := []string{"floatingip", "network", "port", "rbac_policy", "router", "security_group", "security_group_rule", "subnet", "subnetpool"}
+	itest.SeedSQL(t, res.DB,
+		`INSERT INTO networks (id,project_id,status,standard_attr_id) VALUES ('usage','usage-only','ACTIVE',1)`,
+		`INSERT INTO reservations (id,project_id,expiration) VALUES
+		 ('active-a','reservation-only',UTC_TIMESTAMP() + INTERVAL 1 HOUR),
+		 ('active-b','reservation-only',UTC_TIMESTAMP() + INTERVAL 2 HOUR),
+		 ('expired','reservation-only',UTC_TIMESTAMP() - INTERVAL 1 HOUR),
+		 ('expired-owner','expired-only',UTC_TIMESTAMP() - INTERVAL 1 HOUR),
+		 ('no-expiration','null-expiration-only',NULL),
+		 ('system','',UTC_TIMESTAMP() + INTERVAL 1 HOUR)`,
+		`INSERT INTO resourcedeltas (resource,reservation_id,amount) VALUES
+		 ('port','expired-owner',101),('port','no-expiration',103),('port','system',NULL)`,
+	)
+	for i, resource := range resources {
+		_, err := res.DB.Exec(`INSERT INTO resourcedeltas (resource,reservation_id,amount) VALUES (?, 'active-a', ?),(?, 'active-b', ?),(?, 'expired', 100)`, resource, i+1, resource, i+2, resource)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg := collector.NewRegistry(collector.Config{NeutronDatabaseURL: res.URL}, promslog.New(&promslog.Config{}))
+	ts := httptest.NewServer(promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	defer ts.Close()
+	for range 2 {
+		families := scrapeAndParse(t, ts.URL)
+		assertGaugeValue(t, families, "openstack_neutron_up", 1)
+		assertGaugeValue(t, families, "openstack_neutron_quota_up", 1)
+		assertGaugeValue(t, families, "openstack_neutron_quota_skipped_records", 0)
+		assertGaugeValue(t, families, "openstack_neutron_networks", 1)
+		for i, resource := range resources {
+			name := "openstack_neutron_quota_" + resource
+			family := families[name]
+			if family == nil {
+				t.Fatalf("missing %s", name)
+			}
+			if family.GetType() != dto.MetricType_GAUGE || family.GetHelp() != "quota_"+resource || len(family.Metric) != 6 {
+				t.Fatalf("unexpected family contract: %s", family)
+			}
+			assertQuotaValue(t, families, name, "reservation-only", "reserved", float64(2*i+3))
+			assertQuotaValue(t, families, name, "reservation-only", "used", 0)
+			used := float64(0)
+			if resource == "network" {
+				used = 1
+			}
+			assertQuotaValue(t, families, name, "usage-only", "used", used)
+			assertQuotaValue(t, families, name, "usage-only", "reserved", 0)
+			for _, metric := range family.Metric {
+				labels := map[string]string{}
+				for _, label := range metric.Label {
+					labels[label.GetName()] = label.GetValue()
+				}
+				if len(labels) != 4 || labels["tenant"] != labels["tenant_id"] || labels["domain_id"] != "" || (labels["tenant_id"] != "reservation-only" && labels["tenant_id"] != "usage-only") {
+					t.Fatalf("unexpected identity labels: %v", labels)
+				}
+			}
+		}
+	}
+
+	// A later valid delta must not repair an earlier NULL or negative delta.
+	itest.SeedSQL(t, res.DB,
+		`INSERT INTO reservations VALUES ('bad-a','reservation-only',UTC_TIMESTAMP() + INTERVAL 1 HOUR),('bad-b','reservation-only',UTC_TIMESTAMP() + INTERVAL 1 HOUR)`,
+		`INSERT INTO resourcedeltas VALUES ('port','bad-a',-1),('port','bad-b',NULL)`,
+	)
+	families := scrapeAndParse(t, ts.URL)
+	assertGaugeValue(t, families, "openstack_neutron_quota_up", 1)
+	assertGaugeValue(t, families, "openstack_neutron_quota_skipped_records", 2)
+	for _, metric := range families["openstack_neutron_quota_port"].Metric {
+		for _, label := range metric.Label {
+			if label.GetName() == "tenant_id" && label.GetValue() == "reservation-only" {
+				t.Fatal("poisoned port scope was emitted")
+			}
+		}
+	}
+	assertQuotaValue(t, families, "openstack_neutron_quota_network", "reservation-only", "reserved", 5)
+
+	// A failed required reservation read cannot become reserved=0, and the
+	// inventory and HTTP endpoint must remain available.
+	itest.SeedSQL(t, res.DB, `RENAME TABLE reservations TO unavailable_reservations`)
+	families = scrapeAndParse(t, ts.URL)
+	assertGaugeValue(t, families, "openstack_neutron_quota_up", 0)
+	assertGaugeValue(t, families, "openstack_neutron_networks", 1)
+	assertGaugeValue(t, families, "openstack_neutron_up", 1)
+	for name := range families {
+		if strings.HasPrefix(name, "openstack_neutron_quota_") && name != "openstack_neutron_quota_up" {
+			t.Errorf("failed quota read emitted %s", name)
+		}
+	}
+	itest.SeedSQL(t, res.DB, `RENAME TABLE unavailable_reservations TO reservations`, `DELETE FROM resourcedeltas WHERE reservation_id IN ('bad-a','bad-b')`)
+	families = scrapeAndParse(t, ts.URL)
+	assertGaugeValue(t, families, "openstack_neutron_quota_skipped_records", 0)
+	assertQuotaValue(t, families, "openstack_neutron_quota_port", "reservation-only", "reserved", 7)
 }
