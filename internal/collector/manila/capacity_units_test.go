@@ -31,10 +31,16 @@ func TestQuotaCapacityBytes(t *testing.T) {
 				}
 				rows[1].AddRow("p", r.name, raw)
 				// Exceeds the int64 multiplication range after conversion to bytes.
-				rows[3].AddRow("p", r.name, int64(1<<40), -1)
+				for i := range 1024 {
+					reserved := 0
+					if i == 0 {
+						reserved = -1
+					}
+					rows[3].AddRow("p", fmt.Sprint(i), r.name, 1<<30, reserved)
+				}
 				if r.shareType {
 					rows[4].AddRow("p", "gold-id", "gold", r.name, raw)
-					rows[5].AddRow("p", "gold-id", "gold", r.name, 20, -2)
+					rows[5].AddRow("p", "gold-id", "gold", nil, r.name, 20, -2)
 				}
 			}
 			expectQuotaRows(mock, rows)

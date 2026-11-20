@@ -80,6 +80,7 @@ func TestSharesInventoryHTTP(t *testing.T) {
 		{"reverting-promotion-exception", "INSERT INTO share_instances VALUES('i1','share-1','available','active','type-1','az-1','False'),('i2','share-1','replication_change','in_sync','type-2','az-2','False'),('i3','share-1','reverting','in_sync','type-2','az-2','False');", one("available", "type-1", "zone-1")},
 		{"writable-multiple-active", "INSERT INTO share_instances VALUES('i2','share-1','available','active','type-2','az-2','False'),('i1','share-1','available','active','type-1','az-1','False');", one("available", "type-1", "zone-1")},
 		{"migration", "INSERT INTO share_instances VALUES('i1','share-1','migrating_to',NULL,'type-1','az-1','False'),('i2','share-1','migrating',NULL,'type-2','az-2','False');", one("migrating", "type-2", "zone-2")},
+		{"snapshot-revert-priority", "INSERT INTO share_instances VALUES('i1','share-1','reverting_to_snapshot',NULL,'type-1','az-1','False'),('i2','share-1','creating',NULL,'type-2','az-2','False');", one("creating", "type-2", "zone-2")},
 		{"server-migration", "INSERT INTO share_instances VALUES('i1','share-1','server_migrating_to',NULL,'type-1','az-1','False'),('i2','share-1','server_migrating',NULL,'type-2','az-2','False');", one("server_migrating", "type-2", "zone-2")},
 		{"soft-deleted-instance", "INSERT INTO share_instances VALUES('i1','share-1','reverting','active','type-1','az-1','removed'),('i2','share-1','available',NULL,'type-2','az-2','False');", one("available", "type-2", "zone-2")},
 		{"only-deleted-instance", "INSERT INTO share_instances VALUES('i1','share-1','available',NULL,'type-1','az-1','removed');", one("", "", "")},
@@ -95,7 +96,7 @@ func TestSharesInventoryHTTP(t *testing.T) {
 			}
 			for range 2 {
 				rows := emptyQuotaRows()
-				rows[3].AddRow("project-1", "shares", 1, 0)
+				rows[3].AddRow("project-1", nil, "shares", 1, 0)
 				expectQuotaRows(mock, rows)
 				mock.ExpectQuery(regexp.QuoteMeta(heatdb.StackGetAll)).WillReturnRows(sqlmock.NewRows([]string{"id", "name", "status", "action", "tenant"}).AddRow("stack-1", "stack", "CREATE_COMPLETE", "CREATE", "project-1"))
 			}

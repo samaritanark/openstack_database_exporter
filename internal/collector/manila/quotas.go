@@ -90,7 +90,7 @@ type shareTypeKey struct{ projectID, shareTypeID string }
 // reservations, as maintained by Manila's DbQuotaDriver. It does not measure
 // physical backend consumption or combine user and share-type accounting.
 type QuotasCollector struct {
-	quotas          *maniladb.QuotaRepository
+	quotas          *maniladb.Queries
 	logger          *slog.Logger
 	projectResolver *project.Resolver
 	defaults        QuotaDefaults
@@ -113,7 +113,7 @@ func NewQuotasCollector(db *sql.DB, logger *slog.Logger, resolver *project.Resol
 		copied[resource] = value
 	}
 	return &QuotasCollector{
-		quotas:          maniladb.NewQuotaRepository(db),
+		quotas:          maniladb.New(db),
 		logger:          logger.With("namespace", Namespace, "subsystem", Subsystem, "collector", "quotas"),
 		projectResolver: resolver, defaults: copied, queryTimeout: deadline,
 	}
@@ -136,34 +136,34 @@ func (c *QuotasCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.queryTimeout)
 	defer cancel()
-	defaults, err := c.quotas.GetDefaultLimits(ctx)
+	defaults, err := c.quotas.QuotaClassGetDefault(ctx)
 	if err != nil {
 		c.fail(ch, "query default limits", err)
 		return
 	}
-	limits, err := c.quotas.GetProjectLimits(ctx)
+	limits, err := c.quotas.QuotaGetAllByProject(ctx)
 	if err != nil {
 		c.fail(ch, "query project limits", err)
 		return
 	}
 	// Required for discovery of projects with only user-specific quota records.
 	// Per-user enforcement limits are not exported or used as project limits.
-	users, err := c.quotas.GetUserLimits(ctx)
+	users, err := c.quotas.QuotaGetAllByProjectAndUser(ctx)
 	if err != nil {
 		c.fail(ch, "query user limits", err)
 		return
 	}
-	usages, err := c.quotas.GetProjectUsage(ctx)
+	usages, err := c.quotas.QuotaUsageGetAllByProject(ctx)
 	if err != nil {
 		c.fail(ch, "query project usage", err)
 		return
 	}
-	typeLimits, err := c.quotas.GetShareTypeLimits(ctx)
+	typeLimits, err := c.quotas.QuotaGetAllByProjectAndShareType(ctx)
 	if err != nil {
 		c.fail(ch, "query share-type limits", err)
 		return
 	}
-	typeUsages, err := c.quotas.GetShareTypeUsage(ctx)
+	typeUsages, err := c.quotas.QuotaUsageGetAllByProjectAndShareType(ctx)
 	if err != nil {
 		c.fail(ch, "query share-type usage", err)
 		return
@@ -223,12 +223,25 @@ func (c *QuotasCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	for _, row := range usages {
 		if row.ProjectID.Valid && row.ProjectID.String != "" {
-			ensureProject(row.ProjectID.String).usage[row.Resource.String] = quotaUsage{row.InUse, row.Reserved}
+			// This query excludes share-type accounting. Sum users here,
+			// treating each NULL component as zero, as the former SQL totals did.
+			scope := ensureProject(row.ProjectID.String)
+			usage := scope.usage[row.Resource.String]
+			if row.InUse.Valid {
+				usage.inUse += int64(row.InUse.Int32)
+			}
+			if row.Reserved.Valid {
+				usage.reserved += int64(row.Reserved.Int32)
+			}
+			scope.usage[row.Resource.String] = usage
 		}
 	}
 	for _, row := range typeLimits {
-		if row.ProjectID != "" && row.ShareTypeID != "" {
-			scope := ensureType(row.ProjectID, row.ShareTypeID, row.ShareTypeName)
+		// A NULL joined name also represents a deleted/missing type. Omit
+		// these type scopes without failing the scrape; an empty valid name
+		// is still included. Project accounting is independent of this filter.
+		if row.ProjectID != "" && row.ShareTypeID != "" && row.ShareTypeName.Valid {
+			scope := ensureType(row.ProjectID, row.ShareTypeID, row.ShareTypeName.String)
 			if _, tracked := manilaShareTypeQuotaDescs[row.Resource]; tracked {
 				if !validRecordedLimit(row.HardLimit) {
 					c.logger.Error("Invalid persisted Manila share-type limit; omitting affected scope")
@@ -241,8 +254,16 @@ func (c *QuotasCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 	for _, row := range typeUsages {
-		if row.ProjectID.Valid && row.ProjectID.String != "" && row.ShareTypeID.Valid && row.ShareTypeID.String != "" {
-			ensureType(row.ProjectID.String, row.ShareTypeID.String, row.ShareTypeName).usage[row.Resource.String] = quotaUsage{row.InUse, row.Reserved}
+		if row.ProjectID.Valid && row.ProjectID.String != "" && row.ShareTypeID.Valid && row.ShareTypeID.String != "" && row.ShareTypeName.Valid {
+			scope := ensureType(row.ProjectID.String, row.ShareTypeID.String, row.ShareTypeName.String)
+			usage := scope.usage[row.Resource.String]
+			if row.InUse.Valid {
+				usage.inUse += int64(row.InUse.Int32)
+			}
+			if row.Reserved.Valid {
+				usage.reserved += int64(row.Reserved.Int32)
+			}
+			scope.usage[row.Resource.String] = usage
 		}
 	}
 	metadata := c.projectResolver.AllProjects()

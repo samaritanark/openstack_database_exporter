@@ -127,7 +127,7 @@ func serveStalledQuotaConnection(conn net.Conn) {
 		case 0x01: // COM_QUIT
 			return
 		case 0x03: // COM_QUERY
-			if strings.Contains(string(packet[1:]), "QuotaGetActiveLimits") || strings.Contains(string(packet[1:]), "QuotaGetAll") || strings.Contains(string(packet[1:]), "QuotaGetDefaultLimits") {
+			if strings.Contains(string(packet[1:]), "QuotaGetActiveLimits") || strings.Contains(string(packet[1:]), "QuotaGetAll") || strings.Contains(string(packet[1:]), "QuotaGetDefaultLimits") || strings.Contains(string(packet[1:]), "QuotaClassGetDefault") {
 				// Wait for the driver to close the connection on cancellation.
 				_, _ = io.Copy(io.Discard, conn)
 				return

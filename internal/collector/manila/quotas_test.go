@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -31,12 +33,12 @@ var quotaQueries = []struct {
 	query   string
 	columns []string
 }{
-	{maniladb.QuotaGetDefaultLimits, []string{"resource", "hard_limit"}},
-	{maniladb.QuotaGetProjectLimits, []string{"project_id", "resource", "hard_limit"}},
-	{maniladb.QuotaGetUserLimits, []string{"project_id", "user_id", "resource", "hard_limit"}},
-	{maniladb.QuotaUsageGetProjectTotals, []string{"project_id", "resource", "in_use", "reserved"}},
-	{maniladb.QuotaGetShareTypeLimits, []string{"project_id", "share_type_id", "share_type_name", "resource", "hard_limit"}},
-	{maniladb.QuotaUsageGetShareTypeTotals, []string{"project_id", "share_type_id", "share_type_name", "resource", "in_use", "reserved"}},
+	{maniladb.QuotaClassGetDefault, []string{"resource", "hard_limit"}},
+	{maniladb.QuotaGetAllByProject, []string{"project_id", "resource", "hard_limit"}},
+	{maniladb.QuotaGetAllByProjectAndUser, []string{"project_id", "user_id", "resource", "hard_limit"}},
+	{maniladb.QuotaUsageGetAllByProject, []string{"project_id", "user_id", "resource", "in_use", "reserved"}},
+	{maniladb.QuotaGetAllByProjectAndShareType, []string{"project_id", "share_type_id", "share_type_name", "resource", "hard_limit"}},
+	{maniladb.QuotaUsageGetAllByProjectAndShareType, []string{"project_id", "share_type_id", "share_type_name", "user_id", "resource", "in_use", "reserved"}},
 }
 
 func emptyQuotaRows() []*sqlmock.Rows {
@@ -72,18 +74,19 @@ func TestQuotasCollector(t *testing.T) {
 	rows[2].AddRow("p1", "u1", "shares", 1).AddRow("user-only", "u2", "shares", 3)
 	for i, resource := range manilaQuotaResources {
 		if !resource.limitOnly {
-			rows[3].AddRow("p1", resource.name, int64(4000000000)+int64(i), i+3)
+			rows[3].AddRow("p1", "u1", resource.name, 2000000000, 1).
+				AddRow("p1", "u2", resource.name, 2000000000+i, i+2)
 		}
 	}
-	rows[3].AddRow("usage-only", "shares", 4, 2).AddRow("p1", "encryption_keys", 100, 0)
+	rows[3].AddRow("usage-only", "u1", "shares", 4, 2).AddRow("p1", nil, "encryption_keys", 100, 0)
 	rows[4].AddRow("p1", "t1", "gold", "shares", 5).AddRow("p1", "t1", "gold", "gigabytes", -1).
 		AddRow("p1", "t1", "gold", "snapshots", 0).AddRow("type-limit-only", "t1", "gold", "shares", -1)
 	for i, resource := range manilaQuotaResources {
 		if resource.shareType {
-			rows[5].AddRow("p1", "t1", "gold", resource.name, i+10, 2)
+			rows[5].AddRow("p1", "t1", "gold", nil, resource.name, i+10, 2)
 		}
 	}
-	rows[5].AddRow("p1", "t2", "silver", "shares", 6, 1).AddRow("type-usage-only", "t2", "silver", "shares", 3, 1)
+	rows[5].AddRow("p1", "t2", "silver", nil, "shares", 6, 1).AddRow("type-usage-only", "t2", "silver", nil, "shares", 3, 1)
 	expectQuotaRows(mock, rows)
 	defaults := upstreamQuotaDefaults()
 	defaults["share_groups"] = 23
@@ -371,10 +374,10 @@ func TestQuotasRejectInvalidRecordedLimits(t *testing.T) {
 				defer func() { _ = db.Close() }()
 				rows := emptyQuotaRows()
 				rows[1].AddRow("healthy", "shares", 23)
-				rows[3].AddRow("healthy", "shares", 7, 2)
+				rows[3].AddRow("healthy", nil, "shares", 7, 2)
 				rows[4].AddRow("healthy", "gold", "gold", "shares", 11)
-				rows[5].AddRow("healthy", "gold", "gold", "shares", 4, 1)
-				rows[3].AddRow("affected", "shares", 3, 1)
+				rows[5].AddRow("healthy", "gold", "gold", nil, "shares", 4, 1)
+				rows[3].AddRow("affected", nil, "shares", 3, 1)
 				rows[4].AddRow("affected", "silver", "silver", "shares", 9)
 				switch index {
 				case 0:
@@ -490,4 +493,120 @@ func TestQuotasMetricContracts(t *testing.T) {
 		require.ElementsMatch(t, names, gotNames)
 	}
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestQuotasRawAccounting(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		typeName driver.Value
+		included bool
+	}{
+		{"active named type", "gold", true},
+		{"active empty name", "", true},
+		{"active SQL NULL name", nil, false},
+		{"deleted type", nil, false},
+		{"missing type", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = db.Close() })
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			registry := prometheus.NewPedanticRegistry()
+			registry.MustRegister(NewQuotasCollector(db, logger, project.NewResolver(logger, nil, 0), nil))
+			var previous map[string]float64
+			for scrape := range 2 {
+				// The query scopes overlap logically; only project rows contribute
+				// to project totals. NULL components must be zero independently.
+				data := [][][]driver.Value{
+					{{"shares", 80}},
+					{{"p", "shares", 20}},
+					{{"p", "u1", "shares", 1}, {"user-only", "u2", "shares", 1}},
+					{
+						{"p", "u1", "shares", 2, 1}, {"p", "u2", "shares", 3, 2}, {"p", nil, "shares", -7, -5},
+						{"p", "u1", "gigabytes", 2147483647, -2147483648}, {"p", "u2", "gigabytes", 2147483647, -2147483648},
+						{"p", "u1", "snapshots", nil, 5}, {"p", "u2", "snapshots", -3, nil},
+						{"p", nil, "backups", nil, nil}, {"null-only", nil, "backups", nil, nil},
+						{nil, "u1", "shares", 999, 999}, {"", "u1", "shares", 999, 999},
+					},
+					{
+						{"p", "t", tc.typeName, "shares", 10},
+						// Excluded type metadata must not discover an owner or fail
+						// validation of an otherwise healthy collection.
+						{"ignored-limit-only", "gone", nil, "shares", -2},
+					},
+					{
+						{"p", "t", tc.typeName, "u1", "shares", 4, 2}, {"p", "t", tc.typeName, "u2", "shares", -1, nil},
+						{"p", "t", tc.typeName, nil, "shares", nil, -3},
+						{"p", "t", tc.typeName, "u1", "gigabytes", 2147483647, -2147483648},
+						{"p", "t", tc.typeName, "u2", "gigabytes", 2147483647, -2147483648},
+						{"p", "t", tc.typeName, nil, "snapshots", nil, nil},
+						{"ignored-usage-only", "gone", nil, nil, "shares", 999, 999},
+						{nil, "t", "gold", nil, "shares", 999, 999}, {"", "t", "gold", nil, "shares", 999, 999},
+						{"p", nil, "gold", nil, "shares", 999, 999}, {"p", "", "gold", nil, "shares", 999, 999},
+					},
+				}
+				rows := emptyQuotaRows()
+				for i, records := range data {
+					if scrape == 1 {
+						slices.Reverse(records)
+					}
+					for _, record := range records {
+						rows[i].AddRow(record...)
+					}
+				}
+				expectQuotaRows(mock, rows)
+				families, err := registry.Gather()
+				require.NoError(t, err)
+				samples := map[string]float64{}
+				for _, family := range families {
+					for _, metric := range family.Metric {
+						labels := map[string]string{}
+						for _, label := range metric.Label {
+							labels[label.GetName()] = label.GetValue()
+						}
+						if family.GetName() != "openstack_sharev2_quota_up" {
+							require.NotContains(t, []string{"ignored-limit-only", "ignored-usage-only", ""}, labels["tenant_id"], family.GetName())
+						}
+						samples[strings.Join([]string{family.GetName(), labels["tenant_id"], labels["share_type"], labels["type"]}, "/")] = metric.GetGauge().GetValue()
+						if strings.HasPrefix(family.GetName(), "openstack_sharev2_share_type_quota_") {
+							require.Equal(t, tc.typeName, labels["share_type_name"])
+						}
+					}
+				}
+				for key, value := range map[string]float64{
+					"quota_up///":           1,
+					"quota_shares/p//limit": 20, "quota_shares/p//in_use": -2, "quota_shares/p//reserved": -2,
+					"quota_shares/user-only//limit": 80,
+					"quota_bytes/p//in_use":         float64(4294967294) * (1 << 30),
+					"quota_bytes/p//reserved":       float64(-4294967296) * (1 << 30),
+					"quota_snapshots/p//in_use":     -3, "quota_snapshots/p//reserved": 5,
+					"quota_backups/p//in_use": 0, "quota_backups/p//reserved": 0,
+					"quota_backups/null-only//in_use": 0, "quota_backups/null-only//reserved": 0,
+				} {
+					require.Contains(t, samples, "openstack_sharev2_"+key)
+					require.Equal(t, value, samples["openstack_sharev2_"+key], key)
+				}
+				if tc.included {
+					require.Len(t, families, 19)
+					for key, value := range map[string]float64{
+						"shares/p/t/limit": 10, "shares/p/t/in_use": 3, "shares/p/t/reserved": -1,
+						"bytes/p/t/in_use":     float64(4294967294) * (1 << 30),
+						"bytes/p/t/reserved":   float64(-4294967296) * (1 << 30),
+						"snapshots/p/t/in_use": 0, "snapshots/p/t/reserved": 0,
+					} {
+						require.Contains(t, samples, "openstack_sharev2_share_type_quota_"+key)
+						require.Equal(t, value, samples["openstack_sharev2_share_type_quota_"+key], key)
+					}
+				} else {
+					require.Len(t, families, 13) // Project quotas plus healthy collection; no phantom type scopes.
+				}
+				if previous != nil {
+					require.Equal(t, previous, samples, "reversed raw rows or repeated scrape changed accounting")
+				}
+				previous = samples
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }

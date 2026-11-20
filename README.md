@@ -157,6 +157,10 @@ but never replace project limits. Usage-only and override-only owners remain
 visible. Configure Keystone for project names, domains and idle projects;
 without metadata the owner ID becomes `tenant` and `domain_id` is empty.
 Share-type scopes are discovered from limits or usage for active share types.
+A SQL NULL share-type name omits that type's quota series, since the database
+API also uses NULL for deleted or missing types. This includes active types
+whose name is NULL. An empty but non-NULL name remains valid. This omission
+does not fail quota collection or remove independent project accounting.
 
 Use the existing `--quota.defaults-file` / `QUOTA_DEFAULTS_FILE` for effective
 Manila `[quota]` settings. Source capacity settings remain in GiB:
@@ -215,7 +219,7 @@ exported.
 
 This contribution also requires compatible public
 [openstackdb Manila APIs](https://github.com/samaritanark/openstackdb/pull/3),
-including `QuotaRepository` with scoped usage totals and `ShareGetInventory`,
+including the raw project/share-type quota queries and `ShareGetInventory`,
 alongside the inherited Octavia APIs. The tracked v0.2.1 module lacks them.
 A temporary external Go workspace is needed for pre-merge validation; verify
 API compatibility of the selected library revisions before building. Library
