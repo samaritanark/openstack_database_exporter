@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -55,13 +56,19 @@ func NewResolver(logger *slog.Logger, keystoneDB *keystonedb.Queries, ttl time.D
 
 // refresh reloads the project mapping from keystone.
 func (r *Resolver) refresh() {
+	// Preserve the existing refresh behavior for collectors using AllProjects
+	// and Resolve. Only callers of AllProjectsContext supply a metadata deadline.
+	r.refreshContext(context.Background())
+}
+
+func (r *Resolver) refreshContext(ctx context.Context) {
 	if r.keystoneDB == nil {
 		return
 	}
 
-	projects, err := r.keystoneDB.ListProjects(context.Background())
+	projects, err := r.keystoneDB.ListProjects(ctx)
 	if err != nil {
-		r.logger.Error("Failed to load projects from keystone", "error", err)
+		r.logger.Error("Failed to load projects from keystone; retaining cached metadata", "error_type", fmt.Sprintf("%T", err))
 		return
 	}
 
@@ -114,6 +121,24 @@ func (r *Resolver) AllProjects() map[string]Info {
 	defer r.mu.RUnlock()
 
 	// Return a copy to avoid data races
+	result := make(map[string]Info, len(r.projects))
+	for k, v := range r.projects {
+		result[k] = v
+	}
+	return result
+}
+
+// AllProjectsContext refreshes stale metadata within the caller's deadline.
+// Failed refresh retains cached data; unknown owners remain resolvable by ID.
+func (r *Resolver) AllProjectsContext(ctx context.Context) map[string]Info {
+	r.mu.RLock()
+	stale := time.Since(r.lastLoad) > r.ttl
+	r.mu.RUnlock()
+	if stale {
+		r.refreshContext(ctx)
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	result := make(map[string]Info, len(r.projects))
 	for k, v := range r.projects {
 		result[k] = v

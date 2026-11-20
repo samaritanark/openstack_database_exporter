@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -35,6 +36,7 @@ type Config struct {
 	MagnumDatabaseURL    string
 	ManilaDatabaseURL    string
 	NeutronDatabaseURL   string
+	NeutronQuotaOptions  neutron.QuotaOptions
 	OctaviaDatabaseURL   string
 	OctaviaQuotaDefaults octavia.QuotaDefaults
 	// Zero uses the default five-second shared quota query deadline.
@@ -55,7 +57,7 @@ func NewRegistry(cfg Config, logger *slog.Logger) *prometheus.Registry {
 	if cfg.KeystoneDatabaseURL != "" {
 		keystoneConn, err := db.Connect(cfg.KeystoneDatabaseURL)
 		if err != nil {
-			logger.Warn("Failed to connect to keystone database for project name resolution", "error", err)
+			logger.Warn("Failed to connect to keystone database for project name resolution", "error_type", fmt.Sprintf("%T", err))
 		} else {
 			keystoneQueries = keystonedb.New(keystoneConn)
 		}
@@ -69,7 +71,7 @@ func NewRegistry(cfg Config, logger *slog.Logger) *prometheus.Registry {
 	keystone.RegisterCollectors(reg, cfg.KeystoneDatabaseURL, logger)
 	magnum.RegisterCollectors(reg, cfg.MagnumDatabaseURL, logger)
 	manila.RegisterCollectors(reg, cfg.ManilaDatabaseURL, logger)
-	neutron.RegisterCollectors(reg, cfg.NeutronDatabaseURL, projectResolver, logger)
+	neutron.RegisterCollectors(reg, cfg.NeutronDatabaseURL, projectResolver, logger, cfg.NeutronQuotaOptions)
 	nova.RegisterCollectors(reg, cfg.NovaDatabaseURL, cfg.NovaAPIDatabaseURL, cfg.PlacementDatabaseURL, projectResolver, logger)
 	octavia.RegisterCollectors(reg, cfg.OctaviaDatabaseURL, projectResolver, cfg.OctaviaQuotaDefaults, logger, cfg.OctaviaQuotaQueryTimeout)
 	placement.RegisterCollectors(reg, cfg.PlacementDatabaseURL, logger)
