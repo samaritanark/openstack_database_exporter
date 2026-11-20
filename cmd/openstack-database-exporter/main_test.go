@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -108,15 +109,56 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 		 ('ng-002', 'worker-prod', 'clust-001', 'proj-001', 'worker', 5, 1)`,
 	)
 
-	// Manila: shares, instances
+	// Manila: logical shares, representative instances and persisted quota accounting.
 	itest.SeedSQL(t, manilaRes.DB,
 		`INSERT INTO availability_zones (id, name, deleted) VALUES ('az-001', 'nova', 'False')`,
 		`INSERT INTO share_types (id, name, deleted) VALUES ('stype-001', 'default_share_type', 'False')`,
-		`INSERT INTO shares (id, display_name, project_id, size, share_proto, deleted) VALUES
-		 ('share-001', 'my-share', 'proj-001', 100, 'NFS', 'False')`,
-		`INSERT INTO share_instances (id, share_id, status, share_type_id, availability_zone_id, deleted, cast_rules_to_readonly) VALUES
-		 ('si-001', 'share-001', 'available', 'stype-001', 'az-001', 'False', 0)`,
+		`INSERT INTO shares (id, display_name, project_id, size, share_proto, deleted, is_soft_deleted) VALUES
+         ('share-001', 'my-share', 'proj-001', 100, 'NFS', 'False', 0),
+         ('share-zero', 'no-instance', 'proj-001', 20, 'NFS', 'False', 0),
+         ('share-retained', 'retained', 'proj-001', 5, 'NFS', 'False', 1)`,
+		`INSERT INTO share_instances (id, share_id, status, replica_state, share_type_id, availability_zone_id, deleted, cast_rules_to_readonly) VALUES
+         ('si-001', 'share-001', 'available', 'active', 'stype-001', 'az-001', 'False', 0),
+         ('si-002', 'share-001', 'error', 'in_sync', 'stype-001', 'az-001', 'False', 0),
+         ('si-003', 'share-001', 'available', 'active', 'stype-001', 'az-001', 'False', 0)`,
+		`INSERT INTO project_user_quotas (project_id, user_id, resource, hard_limit, deleted) VALUES
+         ('user-only', 'u1', 'shares', 1, 0)`,
 	)
+	manilaResources := []struct {
+		source, metric  string
+		typed, capacity bool
+	}{
+		{"shares", "shares", true, false},
+		{"gigabytes", "bytes", true, true},
+		{"snapshots", "snapshots", true, false},
+		{"snapshot_gigabytes", "snapshot_bytes", true, true},
+		{"share_networks", "share_networks", false, false},
+		{"share_replicas", "share_replicas", true, false},
+		{"replica_gigabytes", "replica_bytes", true, true},
+		{"share_groups", "share_groups", false, false},
+		{"share_group_snapshots", "share_group_snapshots", false, false},
+		{"backups", "backups", false, false},
+		{"backup_gigabytes", "backup_bytes", false, true},
+		{"per_share_gigabytes", "per_share_bytes", false, true},
+	}
+	for i, resource := range manilaResources {
+		limit := 200 + i
+		if resource.source == "per_share_gigabytes" {
+			limit = 64
+		}
+		itest.SeedSQL(t, manilaRes.DB,
+			fmt.Sprintf(`INSERT INTO quota_classes (class_name, resource, hard_limit, deleted) VALUES ('default','%s',%d,0)`, resource.source, 100+i),
+			fmt.Sprintf(`INSERT INTO quotas (project_id, resource, hard_limit, deleted) VALUES ('proj-001','%s',%d,0)`, resource.source, limit),
+			fmt.Sprintf(`INSERT INTO quota_usages (project_id,user_id,share_type_id,resource,in_use,reserved,deleted) VALUES
+             ('proj-001','u1',NULL,'%s',%d,2,0), ('proj-001','u2',NULL,'%s',%d,%d,0)`, resource.source, i+1, resource.source, 2*i+2, i-1),
+		)
+		if resource.typed {
+			itest.SeedSQL(t, manilaRes.DB,
+				fmt.Sprintf(`INSERT INTO project_share_type_quotas (project_id,share_type_id,resource,hard_limit,deleted) VALUES ('proj-001','stype-001','%s',%d,0)`, resource.source, 300+i),
+				fmt.Sprintf(`INSERT INTO quota_usages (project_id,user_id,share_type_id,resource,in_use,reserved,deleted) VALUES ('proj-001',NULL,'stype-001','%s',%d,-2,0)`, resource.source, 101+i),
+			)
+		}
+	}
 
 	// Neutron: agents, router bindings, routers, floating IPs, networks, subnets, ports, security groups, quotas
 	now := time.Now().Format("2006-01-02 15:04:05")
@@ -366,11 +408,61 @@ func TestIntegration_E2E_FullExporter(t *testing.T) {
 	assertMetricExists(t, families, "openstack_container_infra_cluster_masters")
 	assertMetricExists(t, families, "openstack_container_infra_cluster_nodes")
 
-	// Manila
-	assertGaugeValue(t, families, "openstack_sharev2_shares_counter", 1)
-	assertMetricExists(t, families, "openstack_sharev2_share_gb")
+	// Manila: every quota family, exact labels and byte units through HTTP.
+	assertGaugeValue(t, families, "openstack_sharev2_shares_counter", 3)
+	assertGaugeValue(t, families, "openstack_sharev2_quota_up", 1)
+	assertMetricExists(t, families, "openstack_sharev2_share_bytes")
 	assertMetricExists(t, families, "openstack_sharev2_share_status")
 	assertMetricExists(t, families, "openstack_sharev2_share_status_counter")
+	if _, legacy := families["openstack_sharev2_share_gb"]; legacy {
+		t.Error("legacy share_gb family is still exposed")
+	}
+	inventoryIDs := map[string]bool{}
+	var shareBytes float64
+	for _, metric := range families["openstack_sharev2_share_bytes"].GetMetric() {
+		for _, label := range metric.Label {
+			if label.GetName() == "id" {
+				if inventoryIDs[label.GetValue()] {
+					t.Errorf("duplicate logical share %s", label.GetValue())
+				}
+				inventoryIDs[label.GetValue()] = true
+			}
+		}
+		shareBytes += metric.GetGauge().GetValue()
+	}
+	if len(inventoryIDs) != 3 || shareBytes != 125*(1<<30) {
+		t.Errorf("logical share inventory: ids=%v bytes=%g", inventoryIDs, shareBytes)
+	}
+	for i, resource := range manilaResources {
+		factor := float64(1)
+		if resource.capacity {
+			factor = 1 << 30
+		}
+		limit := float64(200 + i)
+		if resource.source == "per_share_gigabytes" {
+			limit = 64
+		}
+		name := "openstack_sharev2_quota_" + resource.metric
+		assertManilaQuotaValue(t, families, name, "", "limit", limit*factor)
+		if resource.source != "per_share_gigabytes" {
+			assertManilaQuotaValue(t, families, name, "", "in_use", float64(3*i+3)*factor)
+			assertManilaQuotaValue(t, families, name, "", "reserved", float64(i+1)*factor)
+		} else {
+			for _, metric := range families[name].GetMetric() {
+				for _, label := range metric.Label {
+					if label.GetName() == "type" && label.GetValue() != "limit" {
+						t.Errorf("per-share capacity must emit limits only: %v", metric)
+					}
+				}
+			}
+		}
+		if resource.typed {
+			name = "openstack_sharev2_share_type_quota_" + resource.metric
+			assertManilaQuotaValue(t, families, name, "stype-001", "limit", float64(300+i)*factor)
+			assertManilaQuotaValue(t, families, name, "stype-001", "in_use", float64(101+i)*factor)
+			assertManilaQuotaValue(t, families, name, "stype-001", "reserved", -2*factor)
+		}
+	}
 
 	// Neutron
 	assertMetricExists(t, families, "openstack_neutron_agent_state")
@@ -829,5 +921,36 @@ func assertQuotaValue(t *testing.T, families map[string]*dto.MetricFamily, name,
 	}
 	if matches != 1 {
 		t.Errorf("%s project=%s type=%s: got %d samples, want 1", name, projectID, kind, matches)
+	}
+}
+
+// Check Manila's complete label contract as well as its numeric byte values.
+func assertManilaQuotaValue(t *testing.T, families map[string]*dto.MetricFamily, name, shareType, kind string, expected float64) {
+	t.Helper()
+	family := families[name]
+	if family == nil || family.GetType() != dto.MetricType_GAUGE {
+		t.Errorf("missing gauge family %s", name)
+		return
+	}
+	want := map[string]string{"tenant": "test-project-1", "tenant_id": "proj-001", "domain_id": "domain-001", "type": kind}
+	if shareType != "" {
+		want["share_type"], want["share_type_name"] = shareType, "default_share_type"
+	}
+	matches := 0
+	for _, metric := range family.Metric {
+		labels := map[string]string{}
+		for _, label := range metric.Label {
+			labels[label.GetName()] = label.GetValue()
+		}
+		if labels["tenant_id"] != "proj-001" || labels["share_type"] != shareType || labels["type"] != kind {
+			continue
+		}
+		matches++
+		if !maps.Equal(labels, want) || metric.Gauge == nil || metric.GetGauge().GetValue() != expected {
+			t.Errorf("%s: got labels=%v value=%v, want labels=%v value=%g", name, labels, metric.Gauge, want, expected)
+		}
+	}
+	if matches != 1 {
+		t.Errorf("%s type=%s share_type=%s: got %d samples, want 1", name, kind, shareType, matches)
 	}
 }
