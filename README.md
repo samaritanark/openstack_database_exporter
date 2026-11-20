@@ -116,3 +116,111 @@ These metrics require the public [openstackdb Octavia quota APIs](https://github
 That contribution is awaiting acceptance upstream; the tracked v0.2.1 dependency
 does not contain these APIs. Builds and tests currently require a temporary Go
 workspace selecting that public library source alongside this exporter.
+
+## Manila quotas and logical share inventory
+
+The Manila collector exports project quota gauges with `tenant`, `tenant_id`,
+`domain_id` and `type` labels. The twelve families are:
+
+- `openstack_sharev2_quota_shares`
+- `openstack_sharev2_quota_bytes`
+- `openstack_sharev2_quota_snapshots`
+- `openstack_sharev2_quota_snapshot_bytes`
+- `openstack_sharev2_quota_share_networks`
+- `openstack_sharev2_quota_share_replicas`
+- `openstack_sharev2_quota_replica_bytes`
+- `openstack_sharev2_quota_share_groups`
+- `openstack_sharev2_quota_share_group_snapshots`
+- `openstack_sharev2_quota_backups`
+- `openstack_sharev2_quota_backup_bytes`
+- `openstack_sharev2_quota_per_share_bytes`
+
+Six corresponding `openstack_sharev2_share_type_quota_` families use suffixes
+`shares`, `bytes`, `snapshots`, `snapshot_bytes`, `share_replicas` and
+`replica_bytes`. They add `share_type` (UUID) and `share_type_name` labels.
+All quota families expose `type="limit"`, `type="in_use"` and `type="reserved"`,
+except `quota_per_share_bytes`, which exposes only `limit`. There is no user
+label. Only the limit value `-1` means unlimited; zero prohibits allocation.
+
+Usage comes from Manila's persisted quota accounting, including signed usage
+and reservations, rather than reconstructing usage from shares. Project totals
+sum per-user rows with no share-type scope; share-type totals are kept separate
+because they describe the same allocations. Reservations already in accounting
+are not added again. These values describe provisioned quota consumption, not
+physical backend consumption. The reads share a deadline but are not a single
+transactional snapshot.
+
+Limits use configured defaults, then the persisted `default` quota class, then
+project overrides, then share-type overrides. Share-type limits inherit project
+limits where no type override exists. User overrides discover project owners
+but never replace project limits. Usage-only and override-only owners remain
+visible. Configure Keystone for project names, domains and idle projects;
+without metadata the owner ID becomes `tenant` and `domain_id` is empty.
+Share-type scopes are discovered from limits or usage for active share types.
+A SQL NULL share-type name omits that type's quota series, since the database
+API also uses NULL for deleted or missing types. This includes active types
+whose name is NULL. An empty but non-NULL name remains valid. This omission
+does not fail quota collection or remove independent project accounting.
+
+Use the existing `--quota.defaults-file` / `QUOTA_DEFAULTS_FILE` for effective
+Manila `[quota]` settings. Source capacity settings remain in GiB:
+
+```json
+{
+  "manila": {
+    "shares": 50,
+    "gigabytes": 1000,
+    "snapshots": 50,
+    "snapshot_gigabytes": 1000,
+    "share_networks": 10,
+    "share_replicas": 100,
+    "replica_gigabytes": 1000,
+    "share_groups": 50,
+    "share_group_snapshots": 50,
+    "backups": 10,
+    "backup_gigabytes": 1000,
+    "per_share_gigabytes": -1
+  }
+}
+```
+
+A supplied Manila section must contain all twelve integer values, each at least
+`-1`; unknown fields, NULLs, fractions and overflow fail startup. No file, or a
+file containing only another service section, uses the Manila 2025.2 defaults
+above and logs a warning. Keep customized defaults synchronized with
+`manila.conf`. Disabled Manila ignores its defaults and timeout validation.
+`--manila.quota-query-timeout` / `MANILA_QUOTA_QUERY_TIMEOUT` sets the shared
+deadline for the six quota reads (default `5s`, positive Go duration). Leave
+room within the scrape timeout for inventory and project metadata collection.
+
+`openstack_sharev2_quota_up` is an unlabeled gauge: `1` for complete quota
+collection, including an empty database, and `0` on failure. Query failures or
+invalid shared defaults omit quota data. Invalid project or share-type limits
+omit the affected scope (and types inheriting an invalid project) while retaining
+valid scopes with `quota_up=0`. Gate quota alerts on this gauge. Inventory health
+remains `openstack_sharev2_up`; a quota failure can leave inventory and other
+services available through HTTP 200. An initial connection failure reports both
+health gauges as zero.
+
+Inventory uses `ShareGetInventory` to emit one record per logical share,
+including zero-instance shares and retained soft-deleted shares whose row is
+still nondeleted. Instance status priority and active-replica preference select
+one representative instance, with the replication-change/reverting exception
+and instance ID tie-breaking. Status, type and availability zone come from that
+same instance; missing instances leave that metadata empty. Status and count
+metric names and label keys remain unchanged. The `size` label remains in GiB.
+
+The existing inventory family `openstack_sharev2_share_gb` is renamed to
+`openstack_sharev2_share_bytes`, preserving its labels. Update dashboards and
+recording rules to the new name. All Manila capacity values now multiply source
+GiB by `2^30`, including negative usage, reservations and inventory values;
+only an unlimited quota **limit** of `-1` stays unscaled. No legacy alias is
+exported.
+
+This contribution also requires compatible public
+[openstackdb Manila APIs](https://github.com/samaritanark/openstackdb/pull/3),
+including the raw project/share-type quota queries and `ShareGetInventory`,
+alongside the inherited Octavia APIs. The tracked v0.2.1 module lacks them.
+A temporary external Go workspace is needed for pre-merge validation; verify
+API compatibility of the selected library revisions before building. Library
+acceptance and dependency reconciliation remain prerequisites for ordinary CI.

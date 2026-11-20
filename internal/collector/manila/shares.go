@@ -51,9 +51,9 @@ var (
 		nil,
 	)
 
-	shareGbDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(Namespace, Subsystem, "share_gb"),
-		"share_gb",
+	shareBytesDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(Namespace, Subsystem, "share_bytes"),
+		"Share provisioned size in bytes (source GiB multiplied by 2^30).",
 		[]string{
 			"id",
 			"name",
@@ -120,7 +120,7 @@ func NewSharesCollector(db *sql.DB, logger *slog.Logger) *SharesCollector {
 
 func (c *SharesCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- manilaUpDesc
-	ch <- shareGbDesc
+	ch <- shareBytesDesc
 	ch <- shareStatusDesc
 	ch <- shareStatusCounterDesc
 	ch <- sharesCounterDesc
@@ -129,7 +129,7 @@ func (c *SharesCollector) Describe(ch chan<- *prometheus.Desc) {
 func (c *SharesCollector) Collect(ch chan<- prometheus.Metric) {
 	ctx := context.Background()
 
-	shares, err := c.queries.ShareGetAllWithInstances(ctx)
+	shares, err := c.queries.ShareGetInventory(ctx)
 	if err != nil {
 		c.logger.Error("Failed to collect manila shares", "error", err)
 		ch <- prometheus.MustNewConstMetric(manilaUpDesc, prometheus.GaugeValue, 0)
@@ -180,12 +180,12 @@ func (c *SharesCollector) Collect(ch chan<- prometheus.Metric) {
 			statusCounts[status]++
 		}
 
-		// share_gb metric - size in GB per share
+		// share_bytes metric - size in bytes per share
 		// Label order matches upstream: id, name, status, availability_zone, share_type, share_proto, share_type_name, project_id
 		ch <- prometheus.MustNewConstMetric(
-			shareGbDesc,
+			shareBytesDesc,
 			prometheus.GaugeValue,
-			float64(size),
+			float64(size)*(1<<30),
 			shareID,
 			name,
 			status,
