@@ -22,11 +22,11 @@ func TestSharesCollector(t *testing.T) {
 					"4be93e2e-ffff-ffff-ffff-603e3ec2a5d6", "share-test", "ffff8fa0ca1a468db8ad00970c1effff", 1, "NFS", "available", "az1", "", "az1",
 				)
 
-				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetAllWithInstances)).WillReturnRows(rows)
+				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetInventory)).WillReturnRows(rows)
 			},
-			ExpectedMetrics: `# HELP openstack_sharev2_share_gb share_gb
-# TYPE openstack_sharev2_share_gb gauge
-openstack_sharev2_share_gb{availability_zone="az1",id="4be93e2e-ffff-ffff-ffff-603e3ec2a5d6",name="share-test",project_id="ffff8fa0ca1a468db8ad00970c1effff",share_proto="NFS",share_type="az1",share_type_name="",status="available"} 1
+			ExpectedMetrics: `# HELP openstack_sharev2_share_bytes Share provisioned size in bytes (source GiB multiplied by 2^30).
+# TYPE openstack_sharev2_share_bytes gauge
+openstack_sharev2_share_bytes{availability_zone="az1",id="4be93e2e-ffff-ffff-ffff-603e3ec2a5d6",name="share-test",project_id="ffff8fa0ca1a468db8ad00970c1effff",share_proto="NFS",share_type="az1",share_type_name="",status="available"} 1073741824
 # HELP openstack_sharev2_share_status share_status
 # TYPE openstack_sharev2_share_status gauge
 openstack_sharev2_share_status{id="4be93e2e-ffff-ffff-ffff-603e3ec2a5d6",name="share-test",project_id="ffff8fa0ca1a468db8ad00970c1effff",share_proto="NFS",share_type="az1",share_type_name="",size="1",status="available"} 1
@@ -72,13 +72,13 @@ openstack_sharev2_up 1
 					"share-3", "test-share-3", "project-1", 5, "NFS", "error", "type-uuid-1", "default", "nova",
 				)
 
-				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetAllWithInstances)).WillReturnRows(rows)
+				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetInventory)).WillReturnRows(rows)
 			},
-			ExpectedMetrics: `# HELP openstack_sharev2_share_gb share_gb
-# TYPE openstack_sharev2_share_gb gauge
-openstack_sharev2_share_gb{availability_zone="nova",id="share-1",name="test-share-1",project_id="project-1",share_proto="NFS",share_type="type-uuid-1",share_type_name="default",status="available"} 10
-openstack_sharev2_share_gb{availability_zone="nova",id="share-2",name="test-share-2",project_id="project-2",share_proto="CIFS",share_type="type-uuid-2",share_type_name="ssd",status="creating"} 20
-openstack_sharev2_share_gb{availability_zone="nova",id="share-3",name="test-share-3",project_id="project-1",share_proto="NFS",share_type="type-uuid-1",share_type_name="default",status="error"} 5
+			ExpectedMetrics: `# HELP openstack_sharev2_share_bytes Share provisioned size in bytes (source GiB multiplied by 2^30).
+# TYPE openstack_sharev2_share_bytes gauge
+openstack_sharev2_share_bytes{availability_zone="nova",id="share-1",name="test-share-1",project_id="project-1",share_proto="NFS",share_type="type-uuid-1",share_type_name="default",status="available"} 10737418240
+openstack_sharev2_share_bytes{availability_zone="nova",id="share-2",name="test-share-2",project_id="project-2",share_proto="CIFS",share_type="type-uuid-2",share_type_name="ssd",status="creating"} 21474836480
+openstack_sharev2_share_bytes{availability_zone="nova",id="share-3",name="test-share-3",project_id="project-1",share_proto="NFS",share_type="type-uuid-1",share_type_name="default",status="error"} 5368709120
 # HELP openstack_sharev2_share_status share_status
 # TYPE openstack_sharev2_share_status gauge
 openstack_sharev2_share_status{id="share-1",name="test-share-1",project_id="project-1",share_proto="NFS",share_type="type-uuid-1",share_type_name="default",size="10",status="available"} 1
@@ -120,7 +120,7 @@ openstack_sharev2_up 1
 					"id", "name", "project_id", "size", "share_proto", "status", "share_type", "share_type_name", "availability_zone",
 				})
 
-				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetAllWithInstances)).WillReturnRows(rows)
+				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetInventory)).WillReturnRows(rows)
 			},
 			ExpectedMetrics: `# HELP openstack_sharev2_share_status_counter share_status_counter
 # TYPE openstack_sharev2_share_status_counter gauge
@@ -160,11 +160,11 @@ openstack_sharev2_up 1
 					"share-null", sql.NullString{Valid: false}, sql.NullString{Valid: false}, sql.NullInt32{Valid: false}, sql.NullString{Valid: false}, sql.NullString{Valid: false}, "", "", "",
 				)
 
-				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetAllWithInstances)).WillReturnRows(rows)
+				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetInventory)).WillReturnRows(rows)
 			},
-			ExpectedMetrics: `# HELP openstack_sharev2_share_gb share_gb
-# TYPE openstack_sharev2_share_gb gauge
-openstack_sharev2_share_gb{availability_zone="",id="share-null",name="",project_id="",share_proto="",share_type="",share_type_name="",status=""} 0
+			ExpectedMetrics: `# HELP openstack_sharev2_share_bytes Share provisioned size in bytes (source GiB multiplied by 2^30).
+# TYPE openstack_sharev2_share_bytes gauge
+openstack_sharev2_share_bytes{availability_zone="",id="share-null",name="",project_id="",share_proto="",share_type="",share_type_name="",status=""} 0
 # HELP openstack_sharev2_share_status share_status
 # TYPE openstack_sharev2_share_status gauge
 openstack_sharev2_share_status{id="share-null",name="",project_id="",share_proto="",share_type="",share_type_name="",size="0",status=""} -1
@@ -200,7 +200,7 @@ openstack_sharev2_up 1
 		{
 			Name: "database query error",
 			SetupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetAllWithInstances)).WillReturnError(sql.ErrConnDone)
+				mock.ExpectQuery(regexp.QuoteMeta(maniladb.ShareGetInventory)).WillReturnError(sql.ErrConnDone)
 			},
 			ExpectedMetrics: `# HELP openstack_sharev2_up up
 # TYPE openstack_sharev2_up gauge

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -15,12 +16,14 @@ import (
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 
 	"github.com/vexxhost/openstack_database_exporter/internal/collector"
+	"github.com/vexxhost/openstack_database_exporter/internal/collector/manila"
 	"github.com/vexxhost/openstack_database_exporter/internal/collector/octavia"
 )
 
 var (
-	quotaQueryTimeout = kingpin.Flag("octavia.quota-query-timeout", "Shared deadline for Octavia quota database queries; must be positive and shorter than the scrape timeout.").Default("5s").Envar("OCTAVIA_QUOTA_QUERY_TIMEOUT").Duration()
-	quotaDefaultsFile = kingpin.Flag("quota.defaults-file", "Optional JSON file containing all seven Octavia quota defaults; otherwise upstream unlimited defaults are assumed.").Envar("QUOTA_DEFAULTS_FILE").String()
+	quotaQueryTimeout       = kingpin.Flag("octavia.quota-query-timeout", "Shared deadline for Octavia quota database queries; must be positive and shorter than the scrape timeout.").Default("5s").Envar("OCTAVIA_QUOTA_QUERY_TIMEOUT").Duration()
+	quotaDefaultsFile       = kingpin.Flag("quota.defaults-file", "Optional JSON file containing complete quota defaults for enabled Octavia and Manila services; otherwise upstream service defaults are assumed.").Envar("QUOTA_DEFAULTS_FILE").String()
+	manilaQuotaQueryTimeout = kingpin.Flag("manila.quota-query-timeout", "Shared deadline for Manila quota database queries; must be positive and shorter than the scrape timeout.").Default("5s").Envar("MANILA_QUOTA_QUERY_TIMEOUT").Duration()
 
 	metricsPath = kingpin.Flag(
 		"web.telemetry-path",
@@ -104,6 +107,14 @@ func main() {
 	if *octaviaDatabaseURL != "" && *quotaDefaultsFile == "" {
 		logger.Warn("No Octavia quota defaults file configured; assuming Octavia 2025.2 upstream unlimited (-1) defaults")
 	}
+	manilaDefaults, err := loadManilaQuotaConfig(*manilaDatabaseURL, *quotaDefaultsFile, *manilaQuotaQueryTimeout, logger)
+	if err != nil {
+		logger.Error("Invalid Manila quota configuration", "error", err)
+		os.Exit(1)
+	}
+	if *manilaDatabaseURL != "" && *quotaDefaultsFile == "" {
+		logger.Warn("No Manila quota defaults file configured; assuming Manila 2025.2 upstream defaults")
+	}
 	reg := collector.NewRegistry(collector.Config{
 		CinderDatabaseURL:        *cinderDatabaseURL,
 		GlanceDatabaseURL:        *glanceDatabaseURL,
@@ -112,6 +123,8 @@ func main() {
 		KeystoneDatabaseURL:      *keystoneDatabaseURL,
 		MagnumDatabaseURL:        *magnumDatabaseURL,
 		ManilaDatabaseURL:        *manilaDatabaseURL,
+		ManilaQuotaDefaults:      manilaDefaults,
+		ManilaQuotaQueryTimeout:  *manilaQuotaQueryTimeout,
 		NeutronDatabaseURL:       *neutronDatabaseURL,
 		OctaviaDatabaseURL:       *octaviaDatabaseURL,
 		OctaviaQuotaDefaults:     quotaDefaults,
@@ -158,6 +171,20 @@ func loadOctaviaQuotaConfig(databaseURL, defaultsFile string, timeout time.Durat
 	defaults, err := octavia.LoadQuotaDefaults(defaultsFile)
 	if err != nil {
 		return nil, fmt.Errorf("octavia quota defaults file %q: %w", defaultsFile, err)
+	}
+	return defaults, nil
+}
+
+func loadManilaQuotaConfig(databaseURL, defaultsFile string, timeout time.Duration, logger *slog.Logger) (manila.QuotaDefaults, error) {
+	if databaseURL == "" {
+		return nil, nil
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("manila quota query timeout must be positive")
+	}
+	defaults, err := manila.LoadQuotaDefaults(defaultsFile, logger)
+	if err != nil {
+		return nil, fmt.Errorf("manila quota defaults file %q: %w", defaultsFile, err)
 	}
 	return defaults, nil
 }

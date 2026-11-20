@@ -27,16 +27,19 @@ const (
 )
 
 type Config struct {
-	CinderDatabaseURL    string
-	GlanceDatabaseURL    string
-	HeatDatabaseURL      string
-	IronicDatabaseURL    string
-	KeystoneDatabaseURL  string
-	MagnumDatabaseURL    string
-	ManilaDatabaseURL    string
-	NeutronDatabaseURL   string
-	OctaviaDatabaseURL   string
-	OctaviaQuotaDefaults octavia.QuotaDefaults
+	CinderDatabaseURL   string
+	GlanceDatabaseURL   string
+	HeatDatabaseURL     string
+	IronicDatabaseURL   string
+	KeystoneDatabaseURL string
+	MagnumDatabaseURL   string
+	ManilaDatabaseURL   string
+	ManilaQuotaDefaults manila.QuotaDefaults
+	// Zero uses the default five-second shared Manila quota query deadline.
+	ManilaQuotaQueryTimeout time.Duration
+	NeutronDatabaseURL      string
+	OctaviaDatabaseURL      string
+	OctaviaQuotaDefaults    octavia.QuotaDefaults
 	// Zero uses the default five-second shared quota query deadline.
 	OctaviaQuotaQueryTimeout time.Duration
 	PlacementDatabaseURL     string
@@ -68,7 +71,7 @@ func NewRegistry(cfg Config, logger *slog.Logger) *prometheus.Registry {
 	ironic.RegisterCollectors(reg, cfg.IronicDatabaseURL, logger)
 	keystone.RegisterCollectors(reg, cfg.KeystoneDatabaseURL, logger)
 	magnum.RegisterCollectors(reg, cfg.MagnumDatabaseURL, logger)
-	manila.RegisterCollectors(reg, cfg.ManilaDatabaseURL, logger)
+	manila.RegisterCollectors(reg, cfg.ManilaDatabaseURL, projectResolver, cfg.ManilaQuotaDefaults, logger, cfg.ManilaQuotaQueryTimeout)
 	neutron.RegisterCollectors(reg, cfg.NeutronDatabaseURL, projectResolver, logger)
 	nova.RegisterCollectors(reg, cfg.NovaDatabaseURL, cfg.NovaAPIDatabaseURL, cfg.PlacementDatabaseURL, projectResolver, logger)
 	octavia.RegisterCollectors(reg, cfg.OctaviaDatabaseURL, projectResolver, cfg.OctaviaQuotaDefaults, logger, cfg.OctaviaQuotaQueryTimeout)
